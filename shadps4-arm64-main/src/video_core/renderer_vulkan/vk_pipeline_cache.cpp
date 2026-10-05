@@ -4,9 +4,12 @@
 #include <exception>
 #include <ranges>
 
+#include <xxhash.h>
 #include "common/hash.h"
+#include "common/perf_toggles.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "core/bench_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -339,6 +342,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        const Core::Bench::CompileTimer compile_timer{true};
 
         GraphicsPipeline::SerializationSupport sdata{};
         try {
@@ -355,12 +359,15 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             }
             it.value() = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-                runtime_infos, fetch_shader, modules, sdata, false);
+                runtime_infos,
+                fetch_shader ? std::optional<const Shader::Gcn::FetchShaderData>{*fetch_shader}
+                             : std::nullopt,
+                modules, sdata, false);
         } catch (const std::exception& ex) {
             LOG_ERROR(Render_Vulkan, "Graphics pipeline {:#x} compile failed: {}", pipeline_hash,
                       ex.what());
             it.value().reset();
-            fetch_shader.reset();
+            fetch_shader = nullptr;
             return nullptr;
         }
 
@@ -375,7 +382,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                 }
             }
         }
-        fetch_shader.reset();
+        fetch_shader = nullptr;
     }
     return it->second.get();
 }
@@ -388,6 +395,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        const Core::Bench::CompileTimer compile_timer{true};
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -500,7 +508,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
-    fetch_shader = std::nullopt;
+    fetch_shader = nullptr;
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
@@ -520,7 +528,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
+        const Shader::Gcn::FetchShaderData* fetch_shader_{};
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
@@ -637,6 +645,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    const Core::Bench::CompileTimer compile_timer{false};
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
@@ -687,6 +696,61 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+namespace {
+
+/// Everything StageSpecialization reads (but the runtime info, compared on its own): where the
+/// bindings start, and every resource's descriptor as the shader finds it, without its address
+/// (nothing of a specialization depends on where a resource is, only on whether there is one),
+/// and the fetch shader with its attributes' descriptors. Equal keys and runtime infos make equal
+/// specializations, so they name the same permutation.
+u64 SpecInputKey(const Shader::Info& info, const Shader::Backend::Bindings& start) {
+    boost::container::small_vector<u64, 256> words;
+    const auto add = [&words](const auto& sharp, bool valid) {
+        static_assert(sizeof(sharp) % sizeof(u64) == 0);
+        std::array<u64, sizeof(sharp) / sizeof(u64)> raw;
+        std::memcpy(raw.data(), &sharp, sizeof(sharp));
+        words.insert(words.end(), raw.begin(), raw.end());
+        words.push_back(valid ? 1 : 0);
+    };
+    words.push_back(u64{start.unified} | (u64{start.buffer} << 32));
+    words.push_back(start.user_data);
+    for (const auto& desc : info.buffers) {
+        auto sharp = desc.GetSharp(info);
+        const bool valid = static_cast<bool>(sharp);
+        sharp.base_address = 0;
+        add(sharp, valid);
+    }
+    for (const auto& desc : info.images) {
+        auto sharp = desc.GetSharp(info);
+        const bool valid = static_cast<bool>(sharp);
+        sharp.base_address = 0;
+        add(sharp, valid);
+    }
+    for (const auto& desc : info.fmasks) {
+        auto sharp = desc.GetSharp(info);
+        const bool valid = static_cast<bool>(sharp);
+        sharp.base_address = 0;
+        add(sharp, valid);
+    }
+    for (const auto& desc : info.samplers) {
+        const auto sharp = desc.GetSharp(info);
+        add(sharp, static_cast<bool>(sharp));
+    }
+    u64 fetch_id = 0;
+    if (const auto* fetch = Shader::Gcn::PeekFetchShader(info, fetch_id); fetch != nullptr) {
+        words.push_back(fetch_id);
+        for (const auto& attrib : fetch->attributes) {
+            auto sharp = attrib.GetSharp(info);
+            const bool valid = static_cast<bool>(sharp);
+            sharp.base_address = 0;
+            add(sharp, valid);
+        }
+    }
+    return XXH3_64bits(words.data(), words.size() * sizeof(u64));
+}
+
+} // namespace
+
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -702,8 +766,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        const auto& stored = program->modules[0].spec.fetch_shader_data;
+        return std::make_tuple(&program->info, module, stored ? &*stored : nullptr, perm_hash);
     }
 
     auto& program = it_pgm.value();
@@ -711,6 +775,27 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    // Tessellation stages also read a constant buffer from memory; they always go the long way.
+    static const bool spec_memo = Common::PerfToggle("SPEC_MEMO");
+    const bool use_memo = spec_memo && l_stage != LogicalStage::TessellationControl &&
+                          l_stage != LogicalStage::TessellationEval;
+    u64 memo_key = 0;
+    if (use_memo) {
+        memo_key = SpecInputKey(info, binding);
+        for (const auto& entry : program->spec_memo) {
+            if (entry.valid && entry.key == memo_key && entry.perm_idx < program->modules.size() &&
+                entry.runtime_info == runtime_info) {
+                Core::Bench::CountSpecMemo(true);
+                info.AddBindings(binding);
+                const auto& perm = program->modules[entry.perm_idx];
+                const auto& stored = perm.spec.fetch_shader_data;
+                return std::make_tuple(&program->info, perm.module, stored ? &*stored : nullptr,
+                                       HashCombine(params.hash, static_cast<size_t>(entry.perm_idx)));
+            }
+        }
+        Core::Bench::CountSpecMemo(false);
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -731,8 +816,15 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    if (use_memo) {
+        auto& entry = program->spec_memo[program->spec_memo_next++ % program->spec_memo.size()];
+        entry = {.key = memo_key,
+                 .runtime_info = runtime_info,
+                 .perm_idx = static_cast<u32>(perm_idx),
+                 .valid = true};
+    }
+    const auto& stored = program->modules[perm_idx].spec.fetch_shader_data;
+    return std::make_tuple(&program->info, module, stored ? &*stored : nullptr, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

@@ -72,4 +72,9 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 
+/// The fetch shader the info's user data points at, as parsed before (parsed now if it was not),
+/// without a copy: valid until the next parse on this thread. `id` names that parse; it differs
+/// for any other code, also code later found at the same address. nullptr without a fetch shader.
+const FetchShaderData* PeekFetchShader(const Shader::Info& info, u64& id);
+
 } // namespace Shader::Gcn

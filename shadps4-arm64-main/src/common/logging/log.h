@@ -20,6 +20,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #include <spdlog/spdlog.h>
 
 #include "common/logging/classes.h"
+#include "common/perf_toggles.h"
 #include "common/path_util.h"
 #include "common/thread.h"
 
@@ -49,10 +50,18 @@ static constexpr std::array level_string_views{"Trace", "Debug",    "Info", "War
 }
 } // namespace Common::Log
 
+namespace Common::Log {
+/// Whether a log line's level is checked before anything is made for it. Without it every line
+/// the filter drops (all of LOG_DEBUG in an ordinary run) still had the thread's name looked up
+/// and its arguments formatted. SHADPS4_PERF_LOG_LEVEL_FIRST=0 goes back to that.
+inline const bool check_level_first = Common::PerfToggle("LOG_LEVEL_FIRST");
+} // namespace Common::Log
+
 // Define the fmt lib macros
 #define LOG_GENERIC(log_class, log_level, format, ...)                                             \
     do {                                                                                           \
-        if (auto logger = Common::Log::ALL_LOGGERS[log_class]) {                                   \
+        if (const auto& logger = Common::Log::ALL_LOGGERS[log_class];                              \
+            logger && (!Common::Log::check_level_first || logger->should_log(log_level))) {        \
             logger->log(log_level, "[{}] <{}> ({}) {}:{} {}: " format, log_class,                  \
                         Common::Log::to_string_view(log_level), Common::GetCurrentThreadName(),    \
                         spdlog::source_loc::basename(__FILE__), __LINE__,                          \

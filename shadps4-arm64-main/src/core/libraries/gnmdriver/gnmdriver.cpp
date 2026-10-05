@@ -15,6 +15,7 @@
 #include "common/logging/log.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
+#include "core/bench_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/known_title.h"
@@ -2334,6 +2335,7 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
         std::this_thread::sleep_for(std::chrono::milliseconds{frame_delay});
     }
     Core::KnownTitle::OnFrameSubmitted();
+    Core::Bench::OnFrame();
     WaitGpuIdle();
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;

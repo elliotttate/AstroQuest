@@ -10,6 +10,7 @@
 #include <vector>
 #include <queue>
 
+#include "common/perf_toggles.h"
 #include "common/types.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
@@ -147,6 +148,8 @@ class DebugStateImpl {
 
     s32 gnm_frame_dump_request_count = -1;
     std::unordered_map<size_t, FrameDump*> waiting_reg_dumps;
+    /// Whether waiting_reg_dumps has anything, for the check every draw makes without a lock.
+    std::atomic<bool> any_waiting_reg_dumps{false};
     std::unordered_map<size_t, std::string> waiting_reg_dumps_dbg;
     bool waiting_submit_pause = false;
     bool should_show_frame_dump = false;
@@ -205,6 +208,11 @@ public:
     }
 
     bool DumpingCurrentReg() {
+        // Every draw asks; almost never is a register dump waiting.
+        static const bool unlocked_check = Common::PerfToggle("DUMP_CHECK");
+        if (unlocked_check && !any_waiting_reg_dumps.load(std::memory_order_acquire)) {
+            return false;
+        }
         std::shared_lock lock{frame_dump_list_mutex};
         return !waiting_reg_dumps.empty();
     }

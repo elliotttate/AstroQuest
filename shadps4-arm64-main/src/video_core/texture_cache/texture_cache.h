@@ -112,13 +112,7 @@ public:
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
-    void UpdateImage(ImageId image_id) {
-        std::scoped_lock lock{mutex};
-        Image& image = slot_images[image_id];
-        TrackImage(image_id);
-        TouchImage(image);
-        RefreshImage(image);
-    }
+    void UpdateImage(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -355,7 +349,9 @@ private:
         u64 registrations{};
     };
     std::array<FoundImage, 1024> found_images{};
-    u64 registrations{1};
+    /// Counts images added and removed (under the lock); read without it by the lock-free
+    /// answers of FindImage on the GPU command thread.
+    std::atomic<u64> registrations{1};
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     tsl::robin_map<vk::Format, ImageId> null_images;

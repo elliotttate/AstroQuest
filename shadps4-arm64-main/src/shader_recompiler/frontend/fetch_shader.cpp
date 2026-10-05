@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -58,7 +59,12 @@ namespace {
 struct ParsedFetchShader {
     std::vector<u32> code;
     FetchShaderData data;
+    u64 id{};
 };
+
+std::atomic<u64> next_parse_id{1};
+
+thread_local std::unordered_map<const u32*, ParsedFetchShader> parsed;
 
 constexpr size_t MaxParsedFetchShaders = 2048;
 
@@ -72,7 +78,6 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
 
     // Keyed by where the code is and checked against what it was: memory gets reused.
-    static thread_local std::unordered_map<const u32*, ParsedFetchShader> parsed;
     if (const auto it = parsed.find(code);
         it != parsed.end() && std::memcmp(code, it->second.code.data(),
                                           it->second.code.size() * sizeof(u32)) == 0) {
@@ -142,7 +147,26 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     auto& entry = parsed[code];
     entry.code.assign(code, code + data.size / sizeof(u32));
     entry.data = data;
+    entry.id = next_parse_id.fetch_add(1, std::memory_order_relaxed);
     return data;
+}
+
+const FetchShaderData* PeekFetchShader(const Shader::Info& info, u64& id) {
+    id = 0;
+    if (!info.has_fetch_shader) {
+        return nullptr;
+    }
+    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (const auto it = parsed.find(code);
+            it != parsed.end() && std::memcmp(code, it->second.code.data(),
+                                              it->second.code.size() * sizeof(u32)) == 0) {
+            id = it->second.id;
+            return &it->second.data;
+        }
+        ParseFetchShader(info);
+    }
+    return nullptr;
 }
 
 } // namespace Shader::Gcn

@@ -15,6 +15,7 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "common/types.h"
+#include "core/bench_stats.h"
 #include "core/signals.h"
 #include "core/tls.h"
 #include "cpu_patches.h"
@@ -692,6 +693,7 @@ static bool TryExecuteIllegalInstruction(void* ctx, void* code_address) {
     }
 
     ASSERT(bytes[1] == 0x0F && bytes[2] == 0x79);
+    Core::Bench::CountEmulatedInstruction();
 
     // Note: It's guaranteed that there's no REX prefix in these instructions checked by
     // Is4ByteExtrqOrInsertq

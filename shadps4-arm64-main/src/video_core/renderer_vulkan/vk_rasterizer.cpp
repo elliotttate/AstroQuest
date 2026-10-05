@@ -218,9 +218,11 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
 }
 
+// (Takes the pipeline's own type: an optional of the non-const type here made every draw copy
+// the fetch shader's attribute list into a temporary.)
 static std::pair<u32, u32> GetDrawOffsets(
     const AmdGpu::Regs& regs, const Shader::Info& info,
-    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
+    const std::optional<const Shader::Gcn::FetchShaderData>& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
     if (fetch_shader) {

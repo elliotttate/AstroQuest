@@ -9,8 +9,11 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/perf_toggles.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "core/bench_stats.h"
+#include "core/thread_profiler.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -115,6 +118,10 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    Core::Bench::RegisterGpuThread();
+    Common::t_gpu_command_thread = true;
+    Core::Profiler::ProfileCurrentThread("GpuCommandProcessor");
+    Core::Profiler::DumpStacksLater();
     gpu_id = std::this_thread::get_id();
 
     while (!stoken.stop_requested()) {

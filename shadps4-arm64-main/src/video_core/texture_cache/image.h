@@ -14,6 +14,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
@@ -184,6 +185,36 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+
+    /// What a binding of the image needs done, readable without the texture cache's lock:
+    /// bit 0 set while the image may be dirty or not fully tracked, the garbage collector tick
+    /// it was last touched at above it. Whatever makes the image dirty or untracks it sets bit
+    /// 0 (under the lock); only TextureCache::UpdateImage clears it, under the lock, after it
+    /// found the image clean, tracked and touched. A binding that finds bit 0 clear and the
+    /// current tick has nothing to do. (Wrapped, since images are moved when their storage
+    /// grows.)
+    struct MovableAtomicU64 {
+        std::atomic<u64> value;
+        MovableAtomicU64(u64 init) : value{init} {}
+        MovableAtomicU64(MovableAtomicU64&& other) noexcept
+            : value{other.value.load(std::memory_order_relaxed)} {}
+        MovableAtomicU64& operator=(MovableAtomicU64&& other) noexcept {
+            value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    static constexpr u64 FastStateDirty = 1;
+    MovableAtomicU64 fast_state{FastStateDirty};
+    void MarkFastStateDirty() noexcept {
+        fast_state.value.fetch_or(FastStateDirty, std::memory_order_release);
+    }
+    void SetFastStateClean(u64 gc_tick) noexcept {
+        fast_state.value.store(gc_tick << 1, std::memory_order_release);
+    }
+    [[nodiscard]] bool FastStateSettled(u64 gc_tick) const noexcept {
+        return fast_state.value.load(std::memory_order_acquire) == (gc_tick << 1);
+    }
+
     ImageId depth_id{};
     u64 depth_uid{};
 

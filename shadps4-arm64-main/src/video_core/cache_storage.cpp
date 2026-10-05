@@ -4,6 +4,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
+#include "common/scm_rev.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 
@@ -95,6 +96,32 @@ void DataBase::Open() {
     const auto& game_info = Common::ElfInfo::Instance();
 
     using namespace Common::FS;
+    // What is kept here was made by one build of the emulator: its SPIR-V comes from that
+    // build's shader recompiler, which the cache's version numbers do not follow. A cache made
+    // by another build is thrown away, so that no shader of an older recompiler is ever used.
+    {
+        const auto cache_dir = GetUserPath(PathType::CacheDir);
+        const auto stamp_path =
+            cache_dir / std::filesystem::path{game_info.GameSerial()}.replace_extension(".build");
+        std::string stamp;
+        if (std::filesystem::exists(stamp_path)) {
+            const auto file = IOFile{stamp_path, FileAccessMode::Read};
+            stamp = file.ReadString(file.GetSize());
+        }
+        if (stamp != Common::g_scm_rev) {
+            std::error_code ec;
+            std::filesystem::remove_all(cache_dir / game_info.GameSerial(), ec);
+            std::filesystem::remove(
+                cache_dir / std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip"),
+                ec);
+            std::filesystem::create_directories(cache_dir, ec);
+            const auto file = IOFile{stamp_path, FileAccessMode::Create};
+            file.WriteString(std::string_view{Common::g_scm_rev});
+            LOG_INFO(Render, "Pipeline cache {}: made by build {}",
+                     stamp.empty() ? "started" : "thrown away, it was made by another build",
+                     Common::g_scm_rev);
+        }
+    }
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 

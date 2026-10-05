@@ -1016,6 +1016,10 @@ set(CORE src/core/aerolib/stubs.cpp
           src/core/guest_cpu/guest_watchdog.cpp
           src/core/guest_cpu/guest_watchdog.h
           src/core/known_title.cpp
+          src/core/bench_stats.cpp
+          src/core/bench_stats.h
+          src/core/thread_profiler.cpp
+          src/core/thread_profiler.h
           src/core/known_title.h
           src/core/linker.cpp
          src/core/linker.h

@@ -173,11 +173,20 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 #ifdef _WIN32
 
 // Sets the debugger-visible name of the current thread.
+namespace {
+// The thread's name as GetCurrentThreadName last found or set it: asking Windows costs a system
+// call and two conversions.
+thread_local std::string t_thread_name;
+thread_local bool t_thread_name_known = false;
+} // namespace
+
 void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    t_thread_name = name;
+    t_thread_name_known = true;
 }
 
 void SetThreadName(void* thread, const char* name) {
@@ -255,9 +264,16 @@ std::string GetCurrentThreadName() {
         return g_curthread->name;
     }
 #ifdef _WIN32
-    PWSTR name;
-    GetThreadDescription(GetCurrentThread(), &name);
-    return Common::UTF16ToUTF8(name);
+    if (t_thread_name_known) {
+        return t_thread_name;
+    }
+    PWSTR name = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &name)) && name != nullptr) {
+        t_thread_name = Common::UTF16ToUTF8(name);
+        LocalFree(name);
+    }
+    t_thread_name_known = true;
+    return t_thread_name;
 #else
     char name[256];
     if (pthread_getname_np(pthread_self(), name, sizeof(name)) != 0) {

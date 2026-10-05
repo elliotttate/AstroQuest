@@ -13,6 +13,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
+#include "common/perf_toggles.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -217,6 +218,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    image.MarkFastStateDirty();
     UntrackImage(image_id);
 }
 
@@ -231,6 +233,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            image.MarkFastStateDirty();
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -261,6 +264,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        image.MarkFastStateDirty();
     });
 }
 
@@ -673,13 +677,42 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         return GetNullImage(info.pixel_format);
     }
 
-    std::scoped_lock lock{mutex};
-    Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageLookups);
-
     auto& found = found_images[((info.guest_address >> 6) ^ (info.guest_address >> 17) ^
                                 static_cast<u64>(info.pixel_format)) %
                                found_images.size()];
-    if (found.registrations == registrations && found.guest_address == info.guest_address &&
+    // The memo is the GPU command thread's (where nearly all lookups are made). There, a repeat
+    // of an answer whose image has been through UpdateImage in this tick of the garbage
+    // collector (touched, so nothing for the lock to do) is given without the lock. Images are
+    // only made on this thread; one removed meanwhile changes `registrations`, read again last.
+    static const bool lock_free_memo = Common::PerfToggle("FINDIMAGE_LOCKFREE");
+    const bool memo_owner = !lock_free_memo || Common::t_gpu_command_thread;
+    if (lock_free_memo && memo_owner) {
+        const u64 seen = registrations.load(std::memory_order_acquire);
+        if (found.registrations == seen && found.guest_address == info.guest_address &&
+            found.guest_size == info.guest_size && found.size == info.size &&
+            found.resources == info.resources && found.pixel_format == info.pixel_format &&
+            found.type == info.type && found.exact_fmt == exact_fmt) {
+            Image& image = slot_images[found.image_id];
+            if (image.FastStateSettled(gc_tick) &&
+                image.info.guest_address == info.guest_address &&
+                image.info.guest_size == info.guest_size && image.info.size == info.size &&
+                IsVulkanFormatCompatible(image.info.pixel_format, info.pixel_format) &&
+                IsViewTypeCompatible(info.type, image.info.type) &&
+                (!exact_fmt || info.pixel_format == image.info.pixel_format) &&
+                !(image.info.resources < info.resources) &&
+                registrations.load(std::memory_order_acquire) == seen) {
+                image.tick_accessed_last = scheduler.CurrentTick();
+                Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageLookups);
+                Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageLookupsShort);
+                return found.image_id;
+            }
+        }
+    }
+
+    std::scoped_lock lock{mutex};
+    Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageLookups);
+
+    if (memo_owner && found.registrations == registrations && found.guest_address == info.guest_address &&
         found.guest_size == info.guest_size && found.size == info.size &&
         found.resources == info.resources && found.pixel_format == info.pixel_format &&
         found.type == info.type && found.exact_fmt == exact_fmt) {
@@ -769,7 +802,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
-    if (perfect_match && image_id == perfect_match) {
+    if (memo_owner && perfect_match && image_id == perfect_match) {
         found = {
             .guest_address = info.guest_address,
             .guest_size = info.guest_size,
@@ -779,7 +812,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             .type = info.type,
             .exact_fmt = exact_fmt,
             .image_id = image_id,
-            .registrations = registrations,
+            .registrations = registrations.load(std::memory_order_relaxed),
         };
     }
 
@@ -907,6 +940,30 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(view_info, false);
 }
 
+void TextureCache::UpdateImage(ImageId image_id) {
+    // Most bindings find the image clean, fully tracked and touched already in this tick of
+    // the garbage collector: the pass below then does nothing but take the lock, which every
+    // texture, render target and depth binding of every draw used to pay. Images are only made
+    // on this thread, so the slot read cannot race with their storage growing.
+    static const bool fast = Common::PerfToggle("IMAGE_FAST_STATE");
+    if (fast && slot_images[image_id].FastStateSettled(gc_tick)) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    Image& image = slot_images[image_id];
+    TrackImage(image_id);
+    TouchImage(image);
+    RefreshImage(image);
+    if (fast && (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1)) {
+        const bool tracked = False(image.flags & ImageFlagBits::Registered) ||
+                             (image.track_addr == image.info.guest_address &&
+                              image.track_addr_end == image.info.guest_address + image.info.guest_size);
+        if (tracked) {
+            image.SetFastStateClean(gc_tick);
+        }
+    }
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -1030,6 +1087,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image.MarkFastStateDirty();
     ++registrations;
     Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageRegistrations);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
@@ -1043,6 +1101,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    image.MarkFastStateDirty();
     ++registrations;
     Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageRegistrations);
     lru_cache.Free(image.lru_id);
@@ -1122,6 +1181,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
 
 void TextureCache::UntrackImage(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     if (!image.IsTracked()) {
         return;
     }
@@ -1136,6 +1196,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
 
 void TextureCache::UntrackImageHead(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     const auto image_begin = image.info.guest_address;
     if (!image.IsTracked() || image_begin < image.track_addr) {
         return;
@@ -1154,6 +1215,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     const auto image_end = image.info.guest_address + image.info.guest_size;
     if (!image.IsTracked() || image.track_addr_end < image_end) {
         return;

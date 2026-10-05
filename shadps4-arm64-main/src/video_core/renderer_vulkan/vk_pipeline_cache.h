@@ -48,6 +48,18 @@ struct Program {
     Shader::Info info;
     ModuleList modules{};
 
+    /// Which permutation draws with given inputs used: the inputs are what StageSpecialization
+    /// reads, hashed (see SpecInputKey), with the runtime info kept to be compared. A repeat
+    /// needs neither a specialization built nor the permutations compared with it.
+    struct SpecMemo {
+        u64 key{};
+        Shader::RuntimeInfo runtime_info{};
+        u32 perm_idx{};
+        bool valid{};
+    };
+    std::array<SpecMemo, 16> spec_memo{};
+    u32 spec_memo_next{};
+
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
@@ -80,8 +92,10 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
+    /// The fetch shader data is the stored permutation's: valid until the program gets another
+    /// permutation, which is longer than the pipeline lookup that asked for it needs it.
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
+                              const Shader::Gcn::FetchShaderData*, u64>;
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
@@ -128,7 +142,9 @@ private:
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    const Shader::Gcn::FetchShaderData* fetch_shader{};
+    /// What a pipeline being loaded from the disk cache has for fetch shader data.
+    std::optional<Shader::Gcn::FetchShaderData> preload_fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
