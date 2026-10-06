@@ -38,6 +38,11 @@ std::atomic<u64> stream_repeats_list{0};
 std::atomic<u64> stream_repeat_bytes_list{0};
 std::atomic<u64> stream_repeats_tick{0};
 std::atomic<u64> stream_repeat_bytes_tick{0};
+std::atomic<u64> stream_memo_hits{0};
+std::atomic<u64> stream_memo_bytes{0};
+std::atomic<u64> timer_fires{0};
+std::atomic<u64> timer_late_ns{0};
+std::atomic<u64> timer_late_max_ns{0};
 std::unordered_set<u64> stream_seen_list;
 std::unordered_set<u64> stream_seen_tick;
 u64 stream_seen_tick_value = ~u64{0};
@@ -88,13 +93,15 @@ u64 Tsc() {
 }
 #endif
 
-std::array<u64, 6> StreamCounters() {
+std::array<u64, 8> StreamCounters() {
     return {stream_copies.load(std::memory_order_relaxed),
             stream_bytes.load(std::memory_order_relaxed),
             stream_repeats_list.load(std::memory_order_relaxed),
             stream_repeat_bytes_list.load(std::memory_order_relaxed),
             stream_repeats_tick.load(std::memory_order_relaxed),
-            stream_repeat_bytes_tick.load(std::memory_order_relaxed)};
+            stream_repeat_bytes_tick.load(std::memory_order_relaxed),
+            stream_memo_hits.load(std::memory_order_relaxed),
+            stream_memo_bytes.load(std::memory_order_relaxed)};
 }
 
 struct Window {
@@ -110,7 +117,9 @@ struct Window {
     u64 pipeline_ns{};
     u64 memo_hits{};
     u64 memo_misses{};
-    std::array<u64, 6> stream{};
+    u64 timers{};
+    u64 timers_late_ns{};
+    std::array<u64, 8> stream{};
     std::vector<double> frames;
 
     void Begin(Clock::time_point now) {
@@ -124,6 +133,9 @@ struct Window {
         pipelines = pipeline_compiles.load(std::memory_order_relaxed);
         pipeline_ns = pipeline_compile_ns.load(std::memory_order_relaxed);
         memo_hits = spec_memo_hits.load(std::memory_order_relaxed);
+        timers = timer_fires.load(std::memory_order_relaxed);
+        timers_late_ns = timer_late_ns.load(std::memory_order_relaxed);
+        timer_late_max_ns.store(0, std::memory_order_relaxed);
         memo_misses = spec_memo_misses.load(std::memory_order_relaxed);
         stream = StreamCounters();
         frames.clear();
@@ -151,7 +163,18 @@ void CountEmulatedInstruction() {
 }
 
 void CountStreamCopy(u64 address, u32 size, u64 tick) {
+    // Telling repeats apart costs the GPU thread a tenth of its time: only on request,
+    // SHADPS4_BENCH_STREAM=1.
+    static const bool analyse = [] {
+        const char* value = std::getenv("SHADPS4_BENCH_STREAM");
+        return value != nullptr && value[0] == '1';
+    }();
     if (!Enabled()) {
+        return;
+    }
+    if (!analyse) {
+        Bump(stream_copies, 1);
+        Bump(stream_bytes, size);
         return;
     }
     const u64 key = address * 0x9E3779B97F4A7C15ULL ^ size;
@@ -171,9 +194,31 @@ void CountStreamCopy(u64 address, u32 size, u64 tick) {
     }
 }
 
+void CountStreamMemoHit(u32 size) {
+    if (!Enabled()) {
+        return;
+    }
+    Bump(stream_memo_hits, 1);
+    Bump(stream_memo_bytes, size);
+}
+
 void OnCommandList() {
     if (Enabled()) {
         stream_seen_list.clear();
+    }
+}
+
+void CountTimerLate(Clock::duration late) {
+    if (!Enabled()) {
+        return;
+    }
+    const u64 ns = static_cast<u64>(
+        std::max<s64>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(late).count()));
+    timer_fires.fetch_add(1, std::memory_order_relaxed);
+    timer_late_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 most = timer_late_max_ns.load(std::memory_order_relaxed);
+    while (ns > most &&
+           !timer_late_max_ns.compare_exchange_weak(most, ns, std::memory_order_relaxed)) {
     }
 }
 
@@ -254,6 +299,9 @@ void OnFrame() {
     for (size_t i = 0; i < stream.size(); ++i) {
         stream[i] -= window.stream[i];
     }
+    const u64 timers = timer_fires.load(std::memory_order_relaxed) - window.timers;
+    const u64 timers_late = timer_late_ns.load(std::memory_order_relaxed) - window.timers_late_ns;
+    const u64 timers_late_max = timer_late_max_ns.load(std::memory_order_relaxed);
     const auto pct = [](u64 part, u64 whole) { return whole ? 100.0 * part / whole : 0.0; };
     LOG_INFO(Core,
              "Bench: {} frames in {:.2f} s ({:.1f} a second); frame ms avg {:.2f} p99 {:.2f} max "
@@ -261,7 +309,9 @@ void OnFrame() {
              "{:.3f}, process {:.3f}; SSE4a emulated {} ({:.1f} a frame); compiled {} shaders "
              "({:.1f} ms) and {} pipelines ({:.1f} ms); shader memo {:.1f}% of {} lookups; stream "
              "copies {:.0f} a frame, {:.0f} KB a frame, repeated in a command list {:.0f}% ({:.0f}% "
-             "of bytes), in a command buffer {:.0f}% ({:.0f}% of bytes)",
+             "of bytes), in a command buffer {:.0f}% ({:.0f}% of bytes); stream memo answered {:.0f} a "
+             "frame ({:.0f} KB a frame not copied); HR timers {:.1f} a frame, late avg {:.0f} us "
+             "max {:.0f} us",
              frames, elapsed, frames / elapsed, frames ? sum / frames : 0.0, p99, longest, over25,
              over50, over100, per_frame_ms(gpu, window.gpu_cycles),
              per_frame_ms(process, window.process_cycles), emulated,
@@ -270,7 +320,10 @@ void OnFrame() {
              memo_hits + memo_misses ? 100.0 * memo_hits / double(memo_hits + memo_misses) : 0.0,
              memo_hits + memo_misses, frames ? double(stream[0]) / frames : 0.0,
              frames ? stream[1] / 1024.0 / frames : 0.0, pct(stream[2], stream[0]),
-             pct(stream[3], stream[1]), pct(stream[4], stream[0]), pct(stream[5], stream[1]));
+             pct(stream[3], stream[1]), pct(stream[4], stream[0]), pct(stream[5], stream[1]),
+             frames ? double(stream[6]) / frames : 0.0, frames ? stream[7] / 1024.0 / frames : 0.0,
+             frames ? double(timers) / frames : 0.0, timers ? timers_late / 1e3 / timers : 0.0,
+             timers_late_max / 1e3);
     window.Begin(now);
     window.last_frame = now;
 }

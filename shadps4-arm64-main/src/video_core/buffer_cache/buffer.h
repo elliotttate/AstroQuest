@@ -179,6 +179,12 @@ public:
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
 
+    /// How many times the buffer went round to its start: space handed out before that may be
+    /// handed out again.
+    u64 Wraps() const noexcept {
+        return wraps;
+    }
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -202,6 +208,7 @@ private:
 private:
     u64 offset{};
     u64 mapped_size{};
+    u64 wraps{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

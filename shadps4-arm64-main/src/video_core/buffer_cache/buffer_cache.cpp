@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/perf_toggles.h"
 #include "common/scope_exit.h"
 #include "core/bench_stats.h"
 #include "core/emulator_settings.h"
@@ -313,6 +314,7 @@ void BufferCache::BindIndexBuffer(u32 index_offset) {
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    Common::NoteGuestWrite();
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
@@ -333,6 +335,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    Common::NoteGuestWrite();
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -433,8 +436,41 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
+        // The same bytes are copied again and again within a command list (each eye's passes
+        // and the shadow pass bind the same vertex, index and constant data): a copy made
+        // earlier is used again while nothing can have changed it, that is in the same command
+        // list, the same command buffer (whose end frees the stream buffer's space), without the
+        // stream buffer having gone round, and without a write to guest memory made for the
+        // GPU or a stop in the command list since (Common::GuestWriteEpoch).
+        static const bool stream_memo = Common::PerfToggle("STREAM_MEMO");
+        StreamCopy* memo = nullptr;
+        if (stream_memo && Common::t_gpu_command_thread) {
+            const u64 tick = scheduler.CurrentTick();
+            const u64 wraps = stream_buffer.Wraps();
+            const u64 epoch = Common::GuestWriteEpoch();
+            if (tick != stream_scope_tick || wraps != stream_scope_wraps ||
+                epoch != stream_scope_epoch) {
+                ++stream_scope;
+                stream_scope_tick = tick;
+                stream_scope_wraps = wraps;
+                stream_scope_epoch = epoch;
+            }
+            const u64 hash = (device_addr >> 4) * 0x9E3779B97F4A7C15ULL ^ size;
+            memo = &stream_copies[(hash ^ (hash >> 32)) % stream_copies.size()];
+            if (memo->scope == stream_scope && memo->address == device_addr &&
+                memo->size == size) {
+                Core::Bench::CountStreamMemoHit(size);
+                return {&stream_buffer, memo->offset};
+            }
+        }
         Core::Bench::CountStreamCopy(device_addr, size, scheduler.CurrentTick());
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        if (memo != nullptr && stream_buffer.Wraps() == stream_scope_wraps) {
+            *memo = {.address = device_addr,
+                     .size = size,
+                     .offset = static_cast<u32>(offset),
+                     .scope = stream_scope};
+        }
         return {&stream_buffer, offset};
     }
     if (IsBufferInvalid(buffer_id)) {

@@ -3,6 +3,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
+#include "common/perf_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #ifndef _WIN32
@@ -157,6 +158,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    Common::NoteGuestWrite();
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",

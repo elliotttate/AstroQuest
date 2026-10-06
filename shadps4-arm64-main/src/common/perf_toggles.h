@@ -3,14 +3,29 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+
+#include "common/types.h"
 
 namespace Common {
 
 /// Set by the GPU command thread for itself as it starts: what only that thread touches can go
 /// without the locks other threads would need.
 inline thread_local bool t_gpu_command_thread = false;
+
+/// Counts the emulator's own writes to guest memory on the GPU's behalf (fences and labels,
+/// packets that write or copy memory, fills) and the moments the GPU command thread stops in a
+/// command list (when the title or another queue may write): what was read from guest memory
+/// before the count moved may no longer be what is there.
+inline std::atomic<u64> g_guest_write_epoch{0};
+inline void NoteGuestWrite() {
+    g_guest_write_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+inline u64 GuestWriteEpoch() {
+    return g_guest_write_epoch.load(std::memory_order_relaxed);
+}
 
 /// Switches for the optimizations of the GPU command thread, so that each can be measured
 /// against the code it replaces in one build: SHADPS4_PERF_<NAME>=0 turns one off,

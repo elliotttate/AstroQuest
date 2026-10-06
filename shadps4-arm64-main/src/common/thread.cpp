@@ -11,6 +11,7 @@
 
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/perf_toggles.h"
 #include "common/thread.h"
 #include "ntapi.h"
 #ifdef __APPLE__
@@ -115,6 +116,29 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
+    // PRECISE_SLEEP: one high resolution timer a thread, kept. The ordinary one wakes up to a
+    // millisecond and a half late (and was made and closed again for every sleep).
+    static const bool precise = Common::PerfToggle("PRECISE_SLEEP");
+    if (precise) {
+        thread_local HANDLE precise_timer = [] {
+            HANDLE made = ::CreateWaitableTimerExW(nullptr, nullptr,
+                                                   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                   TIMER_ALL_ACCESS);
+            return made != nullptr ? made : ::CreateWaitableTimerW(nullptr, TRUE, nullptr);
+        }();
+        SetWaitableTimer(precise_timer, &interval, 0, NULL, NULL, 0);
+        const auto ret = WaitForSingleObjectEx(precise_timer, INFINITE, interruptible);
+        if (ret != WAIT_OBJECT_0) {
+            CancelWaitableTimer(precise_timer);
+        }
+        if (remaining) {
+            const auto end_sleep = std::chrono::high_resolution_clock::now();
+            const auto sleep_time = end_sleep - begin_sleep;
+            *remaining =
+                duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
+        }
+        return ret == WAIT_OBJECT_0;
+    }
     HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
     SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
     const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);

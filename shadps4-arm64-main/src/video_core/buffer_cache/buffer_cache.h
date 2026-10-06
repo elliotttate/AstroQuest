@@ -221,6 +221,18 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
+    /// Copies made into the stream buffer and where (see ObtainBuffer).
+    struct StreamCopy {
+        VAddr address{};
+        u32 size{};
+        u32 offset{};
+        u64 scope{};
+    };
+    std::array<StreamCopy, 4096> stream_copies{};
+    u64 stream_scope{1};
+    u64 stream_scope_tick{~u64{0}};
+    u64 stream_scope_wraps{~u64{0}};
+    u64 stream_scope_epoch{~u64{0}};
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;
     Buffer gds_buffer;

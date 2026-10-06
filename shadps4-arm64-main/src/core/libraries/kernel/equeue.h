@@ -88,6 +88,9 @@ struct EqueueEvent {
     std::chrono::steady_clock::time_point time_added;
     std::chrono::nanoseconds timer_interval;
     std::unique_ptr<boost::asio::steady_timer> timer;
+    /// For an HR timer kept by the precise timer thread (PRECISE_TIMERS): which arming of it is
+    /// current, so a firing meant for an earlier one is not taken for this one.
+    u64 precise_serial = 0;
 
     void Clear() {
         is_triggered = false;
@@ -161,6 +164,8 @@ public:
     bool RemoveEvent(u64 id, s16 filter);
     int WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo);
     bool TriggerEvent(u64 ident, s16 filter, void* trigger_data);
+    /// The precise timer thread's firing of an HR timer: only if it is still that arming.
+    bool TriggerPreciseTimer(u64 ident, u64 serial);
     int GetTriggeredEvents(OrbisKernelEvent* ev, int num);
 
     bool AddSmallTimer(EqueueEvent& event);
@@ -181,6 +186,8 @@ public:
     bool EventExists(u64 id, s16 filter);
 
 private:
+    bool SchedulePreciseTimer(u64 id);
+
     OrbisKernelEqueue m_handle;
     std::string m_name;
     std::mutex m_mutex;

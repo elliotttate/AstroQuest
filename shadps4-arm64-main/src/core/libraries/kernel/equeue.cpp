@@ -1,13 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <functional>
+#include <queue>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
+#ifdef _WIN32
+#include <windows.h>
+#include <immintrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/perf_toggles.h"
 #include "common/singleton.h"
+#include "common/thread.h"
+#include "core/bench_stats.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/kernel.h"
@@ -36,6 +45,140 @@ static void HrTimerCallback(OrbisKernelEqueue eq, const OrbisKernelEvent& kevent
         kqueues[eq]->TriggerEvent(kevent.ident, OrbisKernelEvent::Filter::HrTimer, kevent.udata);
     }
 }
+
+// PRECISE_TIMERS: HR timers of a millisecond or more are kept by a thread of their own instead of
+// the kernel service thread's asio timers. Those wait with the host's ordinary timer, which
+// fires up to a millisecond and a half late, and with them a title that paces its frames by a
+// few milliseconds' timer after each vertical blank (Astro Bot: 3 ms) loses time on every frame.
+// This thread sleeps with a high resolution timer until shortly before the earliest one is due
+// and spins for the rest (SHADPS4_TIMER_SPIN_US, 300 us). How late they fire is in the Bench
+// line (SHADPS4_BENCH).
+namespace {
+
+using PreciseClock = std::chrono::steady_clock;
+
+struct PreciseEntry {
+    PreciseClock::time_point deadline;
+    OrbisKernelEqueue eq;
+    u64 ident;
+    u64 serial;
+    bool operator>(const PreciseEntry& other) const {
+        return deadline > other.deadline;
+    }
+};
+
+class PreciseTimerThread {
+public:
+    static PreciseTimerThread& Instance() {
+        static PreciseTimerThread instance;
+        return instance;
+    }
+
+    void Add(const PreciseEntry& entry) {
+        bool earliest;
+        {
+            std::scoped_lock lock{mutex};
+            earliest = queue.empty() || entry.deadline < queue.top().deadline;
+            queue.push(entry);
+        }
+        if (earliest) {
+            Wake();
+        }
+    }
+
+private:
+    PreciseTimerThread() {
+        if (const char* value = std::getenv("SHADPS4_TIMER_SPIN_US"); value != nullptr) {
+            spin = std::chrono::microseconds{std::clamp(std::atoi(value), 0, 5000)};
+        }
+#ifdef _WIN32
+        wake_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        if (timer == nullptr) {
+            timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        }
+#endif
+        std::thread{[this] { Run(); }}.detach();
+    }
+
+    void Wake() {
+#ifdef _WIN32
+        SetEvent(wake_event);
+#else
+        cv.notify_one();
+#endif
+    }
+
+    void Run() {
+        Common::SetCurrentThreadName("shadPS4:PreciseTimers");
+#ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+        for (;;) {
+            std::unique_lock lock{mutex};
+            if (queue.empty()) {
+#ifdef _WIN32
+                lock.unlock();
+                WaitForSingleObject(wake_event, INFINITE);
+#else
+                cv.wait(lock);
+#endif
+                continue;
+            }
+            const PreciseEntry next = queue.top();
+            const auto now = PreciseClock::now();
+            if (now >= next.deadline) {
+                queue.pop();
+                lock.unlock();
+                if (auto* equeue = GetEqueue(next.eq); equeue != nullptr) {
+                    equeue->TriggerPreciseTimer(next.ident, next.serial);
+                }
+                Core::Bench::CountTimerLate(now - next.deadline);
+                continue;
+            }
+            if (next.deadline - now > spin) {
+                // Asleep until shortly before it is due (an earlier one wakes it).
+#ifdef _WIN32
+                lock.unlock();
+                const auto sleep = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    next.deadline - now - spin);
+                LARGE_INTEGER due{};
+                due.QuadPart = -std::max<s64>(1, sleep.count() / 100);
+                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+                const HANDLE handles[2] = {wake_event, timer};
+                WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+#else
+                cv.wait_until(lock, next.deadline - spin);
+#endif
+                continue;
+            }
+            // The last stretch.
+            lock.unlock();
+            while (PreciseClock::now() < next.deadline) {
+#ifdef _WIN32
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::priority_queue<PreciseEntry, std::vector<PreciseEntry>, std::greater<>> queue;
+    std::chrono::nanoseconds spin{std::chrono::microseconds{300}};
+#ifdef _WIN32
+    HANDLE wake_event{};
+    HANDLE timer{};
+#else
+    std::condition_variable cv;
+#endif
+};
+
+std::atomic<u64> precise_serials{0};
+
+} // Anonymous namespace
 
 static void TimerCallback(OrbisKernelEqueue eq, const OrbisKernelEvent& kevent) {
     if (kqueues.contains(eq) && kqueues[eq]->EventExists(kevent.ident, kevent.filter)) {
@@ -111,10 +254,53 @@ bool EqueueInternal::AddEvent(EqueueEvent& event) {
     if (filter == OrbisKernelEvent::Filter::Timer) {
         return this->ScheduleEvent(id, OrbisKernelEvent::Filter::Timer, TimerCallback);
     } else if (filter == OrbisKernelEvent::Filter::HrTimer) {
+        static const bool precise = Common::PerfToggle("PRECISE_TIMERS");
+        if (precise) {
+            return SchedulePreciseTimer(id);
+        }
         return this->ScheduleEvent(id, OrbisKernelEvent::Filter::HrTimer, HrTimerCallback);
     }
 
     return true;
+}
+
+bool EqueueInternal::SchedulePreciseTimer(u64 id) {
+    PreciseEntry entry{};
+    {
+        std::scoped_lock lock{m_mutex};
+        const auto it = std::ranges::find_if(m_events, [id](auto& ev) {
+            return ev.event.ident == id && ev.event.filter == OrbisKernelEvent::Filter::HrTimer;
+        });
+        if (it == m_events.end()) {
+            return false;
+        }
+        it->precise_serial = precise_serials.fetch_add(1, std::memory_order_relaxed) + 1;
+        entry = {it->time_added +
+                     std::chrono::duration_cast<PreciseClock::duration>(it->timer_interval),
+                 m_handle, id, it->precise_serial};
+    }
+    PreciseTimerThread::Instance().Add(entry);
+    return true;
+}
+
+bool EqueueInternal::TriggerPreciseTimer(u64 ident, u64 serial) {
+    bool has_found = false;
+    {
+        std::scoped_lock lock{m_mutex};
+        for (auto& event : m_events) {
+            if (event.event.ident == ident &&
+                event.event.filter == OrbisKernelEvent::Filter::HrTimer &&
+                event.precise_serial == serial) {
+                event.TriggerTimer();
+                has_found = true;
+                break;
+            }
+        }
+    }
+    if (has_found) {
+        m_cond.notify_one();
+    }
+    return has_found;
 }
 
 bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
@@ -141,7 +327,8 @@ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
     }
 
     it->timer->async_wait(
-        [this, event_data = event.event, callback](const boost::system::error_code& ec) {
+        [this, event_data = event.event, callback,
+         expiry = it->timer->expiry()](const boost::system::error_code& ec) {
             if (ec) {
                 if (ec != boost::system::errc::operation_canceled) {
                     LOG_ERROR(Kernel_Event, "Timer callback error: {}", ec.message());
@@ -150,6 +337,9 @@ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
                     LOG_DEBUG(Kernel_Event, "Timer cancelled");
                 }
                 return;
+            }
+            if (event_data.filter == OrbisKernelEvent::Filter::HrTimer) {
+                Core::Bench::CountTimerLate(std::chrono::steady_clock::now() - expiry);
             }
             callback(this->m_handle, event_data);
         });
