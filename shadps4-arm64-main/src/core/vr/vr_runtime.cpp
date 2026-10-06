@@ -164,7 +164,14 @@ FileConfig LoadFileConfig() {
     if (const char* rate = std::getenv("SHADPS4_VR_REFRESH_RATE"); rate != nullptr) {
         result.config.refresh_rate = static_cast<u32>(std::atoi(rate));
     }
-    if (result.config.refresh_rate < 60 || result.config.refresh_rate > 120) {
+    // SHADPS4_VR_UNCAPPED=<times a second>: for measuring what the title can do. A headset of
+    // the machine's own still shows the frames (the newest one at each of its refreshes), but
+    // no longer sets the pace.
+    if (const char* uncapped = std::getenv("SHADPS4_VR_UNCAPPED");
+        uncapped != nullptr && std::atoi(uncapped) > 0) {
+        result.config.uncapped = true;
+        result.config.refresh_rate = static_cast<u32>(std::clamp(std::atoi(uncapped), 60, 1000));
+    } else if (result.config.refresh_rate < 60 || result.config.refresh_rate > 120) {
         result.config.refresh_rate = 120;
     }
     // SHADPS4_VR_FOV=<percent>: how much of a PlayStation VR's field of view (100 by 103
@@ -233,6 +240,12 @@ void Runtime::Configure(bool psvr_supported, bool psvr_required) {
              "ipd {:.1f} mm, demo motion {}",
              config.headset_connected ? "connected" : "not connected", psvr_supported,
              psvr_required, config.refresh_rate, config.ipd * 1000.0f, config.demo_motion);
+    if (config.uncapped) {
+        LOG_INFO(Core_Vr, "Uncapped for measuring: the headset refreshes {} times a second by its "
+                          "own clock and the title draws as fast as it can; a headset of this "
+                          "machine is shown the newest frame",
+                 config.refresh_rate);
+    }
 }
 
 Vec3 Runtime::PositionToTracker(const Vec3& host) const {
@@ -755,12 +768,13 @@ void Runtime::NoteDisplayRefresh(float rate, u64 time) {
 
 Runtime::DisplayRefresh Runtime::GetDisplayRefresh() const {
     std::scoped_lock lock{mutex};
-    return display_refresh;
+    // Uncapped, the headset keeps its own clock: as if the host's display said nothing.
+    return config.uncapped ? DisplayRefresh{} : display_refresh;
 }
 
 float Runtime::HeadsetRefreshRate() const {
     std::scoped_lock lock{mutex};
-    if (display_refresh.sequence != 0 && display_refresh.rate > 30.0f &&
+    if (!config.uncapped && display_refresh.sequence != 0 && display_refresh.rate > 30.0f &&
         std::chrono::steady_clock::now() - display_refresh.time < std::chrono::milliseconds{500}) {
         return display_refresh.rate;
     }

@@ -251,6 +251,12 @@ const Settings& GetSettings() {
                 parsed.fps_cap = std::min(cap, 240.0);
             }
         }
+        // Uncapped for measuring (SHADPS4_VR_UNCAPPED): one refresh a frame, no cap.
+        if (const char* value = std::getenv("SHADPS4_VR_UNCAPPED");
+            value != nullptr && std::atoi(value) > 0) {
+            parsed.pace = 1;
+            parsed.fps_cap = 0.0;
+        }
         return parsed;
     }();
     return settings;

@@ -94,6 +94,10 @@ struct Config {
     /// Refresh rate the emulated headset panel runs at. Astro Bot renders 60 fps reprojected
     /// to 120 Hz.
     u32 refresh_rate{120};
+    /// SHADPS4_VR_UNCAPPED: for measuring. The headset refreshes by its own clock at
+    /// refresh_rate (up to 1000), whatever a host's display does, and the title is given one
+    /// refresh a frame: it draws as fast as it can, and a host is shown the newest frame.
+    bool uncapped{false};
     /// Sweeps the head when no host is feeding poses, so stereo output can be checked on a
     /// desktop build.
     bool demo_motion{false};

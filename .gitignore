@@ -30,6 +30,7 @@
 !/tools/re/
 !/tools/shims/
 !/tools/tests/
+!/tools/bench/
 /tools/*.local
 
 # Never anywhere: game files and packages.

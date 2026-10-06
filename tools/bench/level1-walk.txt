@@ -1,0 +1,45 @@
+# From the save tools/pc-bench.sh keeps (World 1 reached) into the first level and through
+# its start: CONTINUE, the outline screen, the first planet looked at and chosen (the level
+# loads at about 70 s), the view down the level, then Astro walks forward and jumps every
+# 3 s from 100 s on. Times count from the start of the emulator.
+0 1000 pad=0,-0.17,-0.5
+20 0.3 cross
+24 0.3 cross
+28 0.3 cross
+32 0.3 cross
+36 0.3 cross
+40 0.3 cross
+45 1 head=0,0,0,85,22,0
+50 0.3 cross
+53 0.3 cross
+56 0.3 cross
+59 0.3 cross
+62 0.3 cross
+65 0.3 cross
+68 0.3 cross
+71 0.3 cross
+74 0.3 cross
+77 0.3 cross
+80 0.3 cross
+95 1 head=0,0,0,0,-12,0
+100 60 ly=0
+103 0.3 cross
+106 0.3 cross
+109 0.3 cross
+112 0.3 cross
+115 0.3 cross
+118 0.3 cross
+121 0.3 cross
+124 0.3 cross
+127 0.3 cross
+130 0.3 cross
+133 0.3 cross
+136 0.3 cross
+139 0.3 cross
+142 0.3 cross
+145 0.3 cross
+148 0.3 cross
+151 0.3 cross
+154 0.3 cross
+157 0.3 cross
+160 0.3 cross

@@ -1,0 +1,53 @@
+# From a new game to the first level of World 1 (about 3 minutes), for tools/pc-bench.sh:
+# the opening is passed with the controller held where its outline is, the first planet
+# is chosen by looking at it (85 degrees left, 22 up) and pressing X. The game saves on the
+# way, which tools/pc-bench.sh keeps for the runs after.
+0 1000 pad=0,-0.17,-0.5
+20 0.3 cross
+24 0.3 cross
+28 0.3 cross
+32 0.3 cross
+36 0.3 cross
+40 0.3 cross
+44 0.3 cross
+48 0.3 cross
+52 0.3 cross
+56 0.3 cross
+60 0.3 cross
+64 0.3 cross
+68 0.3 cross
+72 0.3 cross
+76 0.3 cross
+80 0.3 cross
+84 0.3 cross
+88 0.3 cross
+92 0.3 cross
+96 0.3 cross
+100 0.3 cross
+104 0.3 cross
+108 0.3 cross
+112 0.3 cross
+116 0.3 cross
+120 0.3 cross
+124 0.3 cross
+128 0.3 cross
+132 0.3 cross
+136 0.3 cross
+140 0.3 cross
+144 0.3 cross
+155 1 head=0,0,0,85,22,0
+160 0.3 cross
+163 0.3 cross
+166 0.3 cross
+169 0.3 cross
+172 0.3 cross
+175 0.3 cross
+178 0.3 cross
+181 0.3 cross
+184 0.3 cross
+187 0.3 cross
+190 0.3 cross
+193 0.3 cross
+196 0.3 cross
+199 0.3 cross
+215 1 head=0,0,0,0,-12,0

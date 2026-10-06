@@ -729,7 +729,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // after three. For that the thread looks at the queue several times per refresh, without
     // ever waiting for the GPU: the refresh signals themselves stay on time.
     // SHADPS4_EARLY_FLIP=0 goes back to flipping at refreshes only.
-    static constexpr u32 LooksPerRefresh = 8;
+    // (Uncapped for measuring, the refreshes come so often that two looks a refresh are enough.)
+    const u32 LooksPerRefresh = vr.GetConfig().uncapped ? 2 : 8;
     const char* early_setting = std::getenv("SHADPS4_EARLY_FLIP");
     const bool early_flips =
         vr.IsHeadsetConnected() && !(early_setting != nullptr && early_setting[0] == '0');
