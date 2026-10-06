@@ -49,7 +49,19 @@ constexpr u64 StatePositionValid = 0x54;
 constexpr u64 EngineFrameRate = 0x16688a8;         // double
 constexpr u64 EngineFrameSeconds = 0x16688b0;      // float
 constexpr u64 EngineFrameMicroseconds = 0x16688b8; // u64
-constexpr u64 ImageEnd = EngineFrameMicroseconds + sizeof(u64);
+
+// The engine's own frame-rate option, "FrameRate" (60fps, 90fps or 120fps; 60 unless changed).
+// Its display manager makes it with 60 as value and default (0xbe3687: movabs rax, 0x3c0000003c,
+// stored at the option's +0x90), and its Initialize (0xbe4e90) holds it to 60 again
+// (0xbe4fa8: cmp dword [rbx+0x90], 0x3c; 0xbe4fb4: mov esi, 0x3c). When the headset's output
+// starts (0xbe66b0) the option is copied to PresentRate (0xc406c0), and the title's frame start
+// (0xc40d40) waits for two of its refresh ticks (a 3 ms timer after each vblank, 0xc40538) at 60
+// and for one at 90 or 120; frames go to the reprojection after as many of its "end" events.
+constexpr u64 FrameRateValue = 0xbe3689;   // u32 value, u32 default (imm64 of the movabs)
+constexpr u64 FrameRateHeldCmp = 0xbe4fae; // u8 (imm8 of the cmp)
+constexpr u64 FrameRateHeld = 0xbe4fb5;    // u32 (imm32 of the mov)
+constexpr u64 PresentRate = 0x2e460c4;     // s32, 0 until the headset's output starts
+constexpr u64 ImageEnd = PresentRate + sizeof(s32);
 
 // What sets the size the scene is drawn at, a singleton made when first asked for: the size is
 // one of a list (ConsoleSizes, the first three are for a television), a base (4 on the
@@ -191,6 +203,9 @@ constexpr s32 SlowestPace = 6;
 /// The refreshes of the display frames are given at the moment, for the thread that makes
 /// the headset's.
 std::atomic<u32> frame_pace{0};
+/// Half refreshes of the display one refresh of the emulated headset lasts: frame_pace times
+/// two over the headset's refreshes the title takes for a frame (two at 60, one at 90 or 120).
+std::atomic<u32> headset_halves{0};
 
 struct Settings {
     bool time_step{true};
@@ -212,6 +227,10 @@ struct Settings {
     /// The most frames a second wanted, 0 for no such limit: frames are given at least as many
     /// refreshes as keep them to that.
     double fps_cap{};
+    /// SHADPS4_TITLE_NATIVE_RATE=1 (or 120, 90): the title's own frame-rate option is set to
+    /// that (120 for 1) as it loads: it then takes one refresh of its headset for a frame
+    /// instead of two, and the emulated headset refreshes once for every frame it is to draw.
+    s32 native_rate{};
 };
 
 const Settings& GetSettings() {
@@ -256,6 +275,10 @@ const Settings& GetSettings() {
             value != nullptr && std::atoi(value) > 0) {
             parsed.pace = 1;
             parsed.fps_cap = 0.0;
+        }
+        if (const char* value = std::getenv("SHADPS4_TITLE_NATIVE_RATE"); value != nullptr) {
+            const s32 rate = std::atoi(value);
+            parsed.native_rate = rate == 90 ? 90 : rate > 0 ? 120 : 0;
         }
         return parsed;
     }();
@@ -722,6 +745,10 @@ void OnFrameSubmitted() {
     }
     const s32 resolution = TendResolution(base, wanted);
     frame_pace.store(governor.Pace(), std::memory_order_relaxed);
+    // The headset's refreshes the title takes for a frame, by what its presenting goes by.
+    const s32 present_rate = Read<s32>(base + PresentRate);
+    const u32 title_refreshes = present_rate == 90 || present_rate == 120 ? 1 : 2;
+    headset_halves.store(governor.Pace() * 2 / title_refreshes, std::memory_order_relaxed);
 
     if (settings.time_step) {
         // Shorter steps than the title's own only where it is made to draw faster than it
@@ -760,6 +787,10 @@ u32 FramePace() {
     return frame_pace.load(std::memory_order_relaxed);
 }
 
+u32 HeadsetHalves() {
+    return headset_halves.load(std::memory_order_relaxed);
+}
+
 void Prepare() {
     if (Common::ElfInfo::Instance().GameSerial() != "CUSA12392") {
         return;
@@ -780,6 +811,25 @@ void OnGameLoaded(VAddr base, u64 size) {
         std::memcmp(reinterpret_cast<const void*>(base + SetRecentre), SetRecentreCode,
                     sizeof(SetRecentreCode)) != 0) {
         return;
+    }
+    if (const s32 rate = GetSettings().native_rate; rate != 0) {
+        const auto at = [base](u64 offset) { return reinterpret_cast<u8*>(base + offset); };
+        static constexpr u8 Value[] = {0x3c, 0, 0, 0, 0x3c, 0, 0, 0};
+        static constexpr u8 Held[] = {0x3c, 0, 0, 0};
+        if (std::memcmp(at(FrameRateValue), Value, sizeof(Value)) == 0 &&
+            *at(FrameRateHeldCmp) == 0x3c && std::memcmp(at(FrameRateHeld), Held, 4) == 0) {
+            const u32 value = static_cast<u32>(rate);
+            std::memcpy(at(FrameRateValue), &value, 4);
+            std::memcpy(at(FrameRateValue) + 4, &value, 4);
+            *at(FrameRateHeldCmp) = static_cast<u8>(rate);
+            std::memcpy(at(FrameRateHeld), &value, 4);
+            LOG_INFO(Core, "The title's own frame rate is set to {}: it takes one refresh of its "
+                           "headset for a frame instead of two",
+                     rate);
+        } else {
+            LOG_WARNING(Core, "The title's frame-rate option is not where it was expected: it "
+                              "keeps its 60 frames a second");
+        }
     }
     const Larger& larger = GetLarger();
     if (larger.factor == 1.0) {

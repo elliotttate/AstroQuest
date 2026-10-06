@@ -659,7 +659,13 @@ public:
         phase_sum += phase;
         // Where a frame should arrive in the display's refresh: late enough to be fresh, with
         // room for one that takes a little longer than the last.
-        static constexpr double Wanted = 0.55;
+        // (SHADPS4_VR_DELIVERY_PHASE=<0.1..0.9>, for trying others.)
+        static const double Wanted = [] {
+            const char* value = std::getenv("SHADPS4_VR_DELIVERY_PHASE");
+            // (0.35: measured at 120 Hz, 0.3 to 0.4 had the fewest frames that missed their
+            // refresh; at 0.55 one in a hundred came after the host had taken its picture.)
+            return value != nullptr ? std::clamp(std::atof(value), 0.1, 0.9) : 0.35;
+        }();
         static constexpr double Gain = 0.06;
         double error = Wanted * length - phase;
         error -= length * std::round(error / length);
@@ -730,7 +736,17 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // ever waiting for the GPU: the refresh signals themselves stay on time.
     // SHADPS4_EARLY_FLIP=0 goes back to flipping at refreshes only.
     // (Uncapped for measuring, the refreshes come so often that two looks a refresh are enough.)
-    const u32 LooksPerRefresh = vr.GetConfig().uncapped ? 2 : 8;
+    // SHADPS4_PRESENT_LOOKS=<n>: looks a refresh (32: a quarter of a millisecond apart at 120
+    // Hz; at 8 a finished frame waited up to a millisecond to be handed over and the refresh
+    // signals came up to one late, which put the title's frames around the moment the host
+    // takes one).
+    const u32 LooksPerRefresh = [&vr]() -> u32 {
+        if (vr.GetConfig().uncapped) {
+            return 2;
+        }
+        const char* value = std::getenv("SHADPS4_PRESENT_LOOKS");
+        return value != nullptr ? std::clamp(std::atoi(value), 2, 64) : 32;
+    }();
     const char* early_setting = std::getenv("SHADPS4_EARLY_FLIP");
     const bool early_flips =
         vr.IsHeadsetConnected() && !(early_setting != nullptr && early_setting[0] == '0');
@@ -796,7 +812,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // headset refreshes that much more slowly instead: the title, which takes two
             // refreshes of the headset for a frame, then takes that many of the display.
             // (A title nothing is known about takes its two refreshes for a frame.)
-            if (const u32 wanted = Core::KnownTitle::FramePace(); wanted != 0) {
+            // (In the title's own 90 or 120 it takes one refresh for a frame: the headset then
+            // refreshes as slowly as frames are to come, Core::KnownTitle::HeadsetHalves.)
+            if (const u32 wanted = Core::KnownTitle::HeadsetHalves(); wanted != 0) {
                 pace = wanted;
             }
             if (!refresh_clock.IsRefresh(std::chrono::steady_clock::now(), pace)) {
@@ -834,7 +852,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     const auto now = std::chrono::steady_clock::now();
                     Vulkan::FrameStats::Time(Vulkan::FrameStats::Stage::Queued,
                                              now - request.prepared);
-                    refresh_clock.NoteDelivery(now, pace);
+                    const u32 frame_pace = Core::KnownTitle::FramePace();
+                    refresh_clock.NoteDelivery(now, frame_pace != 0 ? frame_pace : pace);
                 }
                 Flip(request);
                 FRAME_END;

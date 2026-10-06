@@ -801,6 +801,11 @@ if ((Setting "fov_of" "headset") -ne "psvr") { $env:SHADPS4_VR_FOV_OF = "headset
 # fps: the most frames a second. (pace, the older way to say it: refreshes of the headset a
 # frame is given, 1 or more.)
 $env:SHADPS4_VR_FPS_CAP = Setting "fps" "60"
+# At 120 the game's own 120 frames a second mode is used (a new frame, drawn and stepped, at
+# every refresh; at 60 a frame lasts two refreshes of the game's headset and the PC had to
+# make those come twice as fast, which it managed about 100 times a second).
+# native_rate=0 keeps the game at its 60 and drives it faster instead.
+if ($env:SHADPS4_VR_FPS_CAP -eq "120" -and (Setting "native_rate" "1") -ne "0") { $env:SHADPS4_TITLE_NATIVE_RATE = "120" }
 $pace = Setting "pace" ""
 if ($pace -eq "1") { $env:SHADPS4_VR_FASTEST_PACE = "1"; $env:SHADPS4_VR_FPS_CAP = "" } elseif ($pace -ne "" -and $pace -ne "2") { $env:SHADPS4_VR_PACE = $pace }
 if ((Setting "headset" "1") -eq "0") { $env:SHADPS4_OPENXR = "0" }

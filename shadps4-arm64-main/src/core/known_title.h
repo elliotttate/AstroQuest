@@ -38,6 +38,14 @@ void OnFrameSubmitted();
 /// the display again, at a frame for every three refreshes.
 u32 FramePace();
 
+/// How many half refreshes of the display one refresh of the emulated headset is to last, 0
+/// where nothing is known: FramePace() times two over the headset's refreshes the title takes
+/// for a frame. That is two at the title's own 60 frames a second, which makes this
+/// FramePace(); one in the title's own 90 and 120 (SHADPS4_TITLE_NATIVE_RATE), where the headset
+/// then refreshes once for every frame and the title's frame start, a timer 3 ms after each
+/// refresh, has a whole refresh to fall into instead of half of one.
+u32 HeadsetHalves();
+
 /// Called with the head position just handed to the title: what the title makes of it goes to
 /// the log every now and then, and whenever the title takes stock of the player's seat anew.
 void NoteView(const Vr::Vec3& tracker_head);
