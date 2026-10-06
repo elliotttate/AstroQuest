@@ -44,6 +44,7 @@
 #include <system_error>
 #include <vector>
 #include <boost/container/static_vector.hpp>
+#include <xxhash.h>
 #include <imgui.h>
 #include <png.h>
 #include <vk_mem_alloc.h>
@@ -845,6 +846,229 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     return frame;
 }
 
+namespace {
+
+// SHADPS4_VR_FRAME_PROBE=1: proof that every frame the title hands to the headset is a picture
+// of its own, not the one before shown again. Nine blocks of 256x256 pixels spread over the
+// left eye (a 3x3 grid), as the title drew it (before anything of the emulator's), are read
+// back for every frame and compared with the frame before's: frame_probe.csv in the log folder
+// has each frame's id, where the title's eye image was, the blocks' hash and how much of them
+// changed, and the log says every 10 s how many frames were the same as the one before.
+class FrameProbe {
+public:
+    static bool Enabled() {
+        static const bool enabled = std::getenv("SHADPS4_VR_FRAME_PROBE") != nullptr;
+        return enabled;
+    }
+
+    void Capture(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                 VideoCore::Image& image, u32 frame_id) {
+        Drain(scheduler);
+        Slot& slot = slots[next];
+        if (slot.pending) {
+            ++missed;
+            return;
+        }
+        const u32 bpp = std::max(image.info.num_bits / 8, 1u);
+        const u32 width = std::min(Size, image.info.size.width / Grid);
+        const u32 height = std::min(Size, image.info.size.height / Grid);
+        const u64 block_bytes = u64{width} * height * bpp;
+        if (!slot.buffer) {
+            slot.buffer = std::make_unique<VideoCore::Buffer>(
+                instance, scheduler, VideoCore::MemoryUsage::Download, 0,
+                vk::BufferUsageFlagBits::eTransferDst, u64{Size} * Size * 16 * Grid * Grid);
+        }
+        if (block_bytes * Grid * Grid > slot.buffer->SizeBytes() || image.info.num_samples != 1 ||
+            width == 0 || height == 0) {
+            return;
+        }
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                      {}, cmdbuf);
+        std::array<vk::BufferImageCopy, Grid * Grid> regions;
+        for (u32 row = 0; row < Grid; ++row) {
+            for (u32 column = 0; column < Grid; ++column) {
+                const u32 cell_width = image.info.size.width / Grid;
+                const u32 cell_height = image.info.size.height / Grid;
+                regions[row * Grid + column] = vk::BufferImageCopy{
+                    .bufferOffset = block_bytes * (row * Grid + column),
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource{
+                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .mipLevel = 0,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                    .imageOffset{static_cast<s32>(column * cell_width + (cell_width - width) / 2),
+                                 static_cast<s32>(row * cell_height + (cell_height - height) / 2),
+                                 0},
+                    .imageExtent{width, height, 1},
+                };
+            }
+        }
+        cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                                 slot.buffer->Handle(), regions);
+        slot.pending = true;
+        slot.tick = scheduler.CurrentTick();
+        slot.frame_id = frame_id;
+        slot.address = image.info.guest_address;
+        slot.bytes = static_cast<u32>(block_bytes * Grid * Grid);
+        next = (next + 1) % slots.size();
+    }
+
+private:
+    static constexpr u32 Size = 256;
+    static constexpr u32 Grid = 3;
+
+    struct Slot {
+        std::unique_ptr<VideoCore::Buffer> buffer;
+        bool pending{};
+        u64 tick{};
+        u32 frame_id{};
+        u64 address{};
+        u32 bytes{};
+    };
+
+    void Drain(Scheduler& scheduler) {
+        // Oldest first, and only while they are done: frames are compared in their order.
+        for (size_t i = 0; i < slots.size(); ++i) {
+            Slot& slot = slots[(next + i) % slots.size()];
+            if (!slot.pending) {
+                continue;
+            }
+            if (!scheduler.IsFree(slot.tick)) {
+                break;
+            }
+            Process(slot);
+            slot.pending = false;
+        }
+    }
+
+    void Process(const Slot& slot) {
+        const u8* data = slot.buffer->mapped_data.data();
+        const u64 hash = XXH3_64bits(data, slot.bytes);
+        double changed = -1.0;
+        const bool follows = have_previous && slot.frame_id == previous_id + 1 &&
+                             previous.size() == slot.bytes;
+        if (follows) {
+            u64 differing = 0;
+            for (u32 i = 0; i < slot.bytes; ++i) {
+                differing += data[i] != previous[i];
+            }
+            changed = static_cast<double>(differing) / slot.bytes;
+            ++compared;
+            if (differing == 0) {
+                ++identical;
+                // (A black picture, as in a fade between scenes, is the same as the black one
+                // before it without anything being shown twice.)
+                // (Colour only: a black picture is opaque, its alpha is not 0.)
+                bool black = true;
+                for (u32 i = 0; i < slot.bytes && black; i += 4) {
+                    black = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0;
+                }
+                if (black) {
+                    ++identical_black;
+                }
+                // The first frame of a run of the same picture, as a picture of its own
+                // (probe_<frame>.ppm in the log folder, the nine blocks as a 3x3 mosaic).
+                if (!in_run && dumps < 80) {
+                    ++dumps;
+                    Dump(data, slot);
+                }
+                in_run = true;
+            } else {
+                in_run = false;
+                if (changed < 0.0001) {
+                    ++nearly;
+                }
+            }
+            changed_sum += changed;
+        }
+        previous.assign(data, data + slot.bytes);
+        previous_id = slot.frame_id;
+        have_previous = true;
+        if (file == nullptr) {
+            const auto path =
+                Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "frame_probe.csv";
+            file = std::fopen(path.string().c_str(), "w");
+            if (file != nullptr) {
+                std::fputs("frame,address,hash,changed\n", file);
+            }
+        }
+        if (file != nullptr) {
+            std::fprintf(file, "%u,%llx,%016llx,%.6f\n", slot.frame_id,
+                         static_cast<unsigned long long>(slot.address),
+                         static_cast<unsigned long long>(hash), changed);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (report_time == std::chrono::steady_clock::time_point{}) {
+            report_time = now;
+        }
+        if (now - report_time >= std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan,
+                     "Frame probe: {} frames compared with the one before: {} the same picture "
+                     "({} of them black, as in a fade), {} nearly (under 0.01% of the bytes "
+                     "changed); on average {:.1f}% of the bytes changed; {} frames not read back "
+                     "(busy)",
+                     compared, identical, identical_black, nearly,
+                     compared ? 100.0 * changed_sum / compared : 0.0, missed);
+            report_time = now;
+            compared = identical = identical_black = nearly = missed = 0;
+            changed_sum = 0.0;
+            if (file != nullptr) {
+                std::fflush(file);
+            }
+        }
+    }
+
+    void Dump(const u8* data, const Slot& slot) {
+        const u32 block = slot.bytes / (Grid * Grid);
+        const u32 side = static_cast<u32>(std::sqrt(static_cast<double>(block / 4)));
+        if (side == 0 || side * side * 4 != block) {
+            return;
+        }
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                          fmt::format("probe_{}.ppm", slot.frame_id);
+        std::FILE* out = std::fopen(path.string().c_str(), "wb");
+        if (out == nullptr) {
+            return;
+        }
+        std::fprintf(out, "P6 %u %u 255 ", side * Grid, side * Grid);
+        std::vector<u8> row(side * Grid * 3);
+        for (u32 y = 0; y < side * Grid; ++y) {
+            for (u32 x = 0; x < side * Grid; ++x) {
+                const u32 cell = (y / side) * Grid + x / side;
+                const u8* pixel = data + cell * block + ((y % side) * side + x % side) * 4;
+                row[x * 3] = pixel[0];
+                row[x * 3 + 1] = pixel[1];
+                row[x * 3 + 2] = pixel[2];
+            }
+            std::fwrite(row.data(), 1, row.size(), out);
+        }
+        std::fclose(out);
+    }
+
+    bool in_run{};
+    u32 dumps{};
+    std::array<Slot, 8> slots{};
+    size_t next{};
+    std::vector<u8> previous;
+    u32 previous_id{};
+    bool have_previous{};
+    std::FILE* file{};
+    std::chrono::steady_clock::time_point report_time{};
+    u32 compared{};
+    u32 identical{};
+    u32 identical_black{};
+    u32 nearly{};
+    u32 missed{};
+    double changed_sum{};
+};
+
+FrameProbe g_frame_probe;
+
+} // Anonymous namespace
+
 HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textures, u32 frame_id,
                                      u32& eye_width, u32& eye_height) {
     // The guest hands the eyes over as plain textures; they were rendered as color targets, so
@@ -955,6 +1179,11 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
         .imageMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
         .pImageMemoryBarriers = pre_barriers.data(),
     });
+
+    if (FrameProbe::Enabled()) {
+        g_frame_probe.Capture(instance, draw_scheduler, cmdbuf,
+                              texture_cache.GetImage(image_ids[0]), frame_id);
+    }
 
     std::array<vk::ImageView, 2> eye_views;
     for (u32 eye = 0; eye < 2; ++eye) {

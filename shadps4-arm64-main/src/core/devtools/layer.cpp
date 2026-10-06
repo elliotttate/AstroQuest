@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "layer.h"
 
 #include <SDL3/SDL_events.h>
@@ -272,7 +273,23 @@ void L::DrawAdvanced() {
 }
 
 void L::DrawSimple() {
-    const float frameRate = DebugState.Framerate;
+    // The title's own frames a second (sceGnmSubmitDone), counted over half a second: the
+    // window may be drawn less often than the title draws (a headset shown every frame, the
+    // window at most SHADPS4_VR_WINDOW_FPS). The window's own rate while the title hands in
+    // no frames.
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point counted_at = Clock::now();
+    static s32 counted_frames = DebugState.gnm_frame_count.load();
+    static float title_rate = 0.0f;
+    const auto now = Clock::now();
+    const float elapsed = std::chrono::duration<float>(now - counted_at).count();
+    if (elapsed >= 0.5f) {
+        const s32 frames = DebugState.gnm_frame_count.load();
+        title_rate = static_cast<float>(frames - counted_frames) / elapsed;
+        counted_frames = frames;
+        counted_at = now;
+    }
+    const float frameRate = title_rate >= 1.0f ? title_rate : DebugState.Framerate;
     if (frameRate < 10) {
         PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.0f, 0.0f, 1.0f)); // Red
     } else if (frameRate >= 10 && frameRate < 20) {

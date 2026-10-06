@@ -26,7 +26,15 @@
 
 namespace Vulkan {
 
-constexpr u64 MAX_IN_FLIGHT_SUBMISSIONS = 8;
+// Submissions to the GPU that may be in flight before the next one waits for the oldest
+// (SHADPS4_VK_IN_FLIGHT, 2 to 64).
+static u64 MaxInFlightSubmissions() {
+    static const u64 most = [] {
+        const char* value = std::getenv("SHADPS4_VK_IN_FLIGHT");
+        return value != nullptr ? static_cast<u64>(std::clamp(std::atoi(value), 2, 64)) : u64{8};
+    }();
+    return most;
+}
 
 namespace {
 
@@ -634,8 +642,8 @@ void TraceSync(const char* format, ...) {
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = master_semaphore.NextTick();
-    if (signal_value > MAX_IN_FLIGHT_SUBMISSIONS) {
-        master_semaphore.Wait(signal_value - MAX_IN_FLIGHT_SUBMISSIONS);
+    if (const u64 most = MaxInFlightSubmissions(); signal_value > most) {
+        master_semaphore.Wait(signal_value - most);
     }
 
 #if TRACY_GPU_ENABLED

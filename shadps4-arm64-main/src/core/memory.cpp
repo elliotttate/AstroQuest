@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <thread>
+#include <condition_variable>
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/perf_toggles.h"
+#include "common/thread.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #ifndef _WIN32
@@ -137,6 +141,99 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     rasterizer->MapMemory(address, size);
 }
 
+namespace {
+
+// PARALLEL_COPY: copies of a megabyte or more (textures the GPU thread uploads as they come into
+// view, many megabytes at once) are split over a few threads. One thread copying into the
+// staging memory the GPU reads from was the largest part of the hitch when new scenery appears
+// (level 1: about 27 ms in one frame).
+class CopyPool {
+public:
+    static constexpr u64 Threshold = u64{1} << 20;
+
+    static CopyPool& Instance() {
+        static CopyPool pool;
+        return pool;
+    }
+
+    void Copy(u8* dest, const u8* src, u64 size) {
+        std::scoped_lock call{call_mutex};
+        const u64 parts = Workers + 1;
+        const u64 chunk = ((size + parts - 1) / parts + 63) & ~u64{63};
+        {
+            std::scoped_lock lock{mutex};
+            pending = 0;
+            for (u32 i = 0; i < Workers; ++i) {
+                const u64 begin = std::min(size, (i + 1) * chunk);
+                const u64 end = std::min(size, (i + 2) * chunk);
+                jobs[i] = {dest + begin, src + begin, end - begin};
+                pending += end > begin;
+            }
+            ++generation;
+        }
+        work_cv.notify_all();
+        std::memcpy(dest, src, std::min(size, chunk));
+        std::unique_lock lock{mutex};
+        done_cv.wait(lock, [this] { return pending == 0; });
+    }
+
+private:
+    static constexpr u32 Workers = 5;
+
+    struct Job {
+        u8* dest;
+        const u8* src;
+        u64 size;
+    };
+
+    CopyPool() {
+        for (u32 i = 0; i < Workers; ++i) {
+            std::thread{[this, i] { Run(i); }}.detach();
+        }
+    }
+
+    void Run(u32 index) {
+        Common::SetCurrentThreadName("shadPS4:CopyWorker");
+        u64 seen = 0;
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock{mutex};
+                work_cv.wait(lock, [&] { return generation != seen; });
+                seen = generation;
+                job = jobs[index];
+            }
+            if (job.size == 0) {
+                continue;
+            }
+            std::memcpy(job.dest, job.src, job.size);
+            std::scoped_lock lock{mutex};
+            if (--pending == 0) {
+                done_cv.notify_one();
+            }
+        }
+    }
+
+    std::mutex call_mutex;
+    std::mutex mutex;
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    std::array<Job, Workers> jobs{};
+    u64 generation{};
+    u32 pending{};
+};
+
+void LargeCopy(u8* dest, const u8* src, u64 size) {
+    static const bool parallel = Common::PerfToggle("PARALLEL_COPY");
+    if (parallel && size >= CopyPool::Threshold) {
+        CopyPool::Instance().Copy(dest, src, size);
+    } else {
+        std::memcpy(dest, src, size);
+    }
+}
+
+} // Anonymous namespace
+
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
@@ -146,7 +243,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     while (size) {
         u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
         if (vma->second.IsMapped()) {
-            std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), copy_size);
+            LargeCopy(dest, std::bit_cast<const u8*>(virtual_addr), copy_size);
         } else {
             std::memset(dest, 0, copy_size);
         }

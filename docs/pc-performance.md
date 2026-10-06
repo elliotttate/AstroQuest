@@ -689,6 +689,70 @@ game waits for the GPU itself before reusing them; with `copyGPUBuffers` it stay
 level 1 it did not reduce repeated pictures (1.00 a second against 0.75 to 0.87 without it, and
 worse in one paired run on a busier PC), so it is off by default.
 
+### Are they really 120 different pictures? (SHADPS4_VR_FRAME_PROBE)
+
+The counters above count the game's frames (one for each `sceGnmSubmitDone`, and the headset's
+frame ids go up by one a picture). That proves the emulator does not show a frame twice, but not
+that the game drew something new each time: a game can render the same moment twice. So the
+pictures themselves are compared. With `SHADPS4_VR_FRAME_PROBE=1`, for every frame the game hands
+to the headset, nine blocks of 256x256 pixels spread over the left eye (a 3x3 grid, from the
+game's own eye image, before any processing of the emulator's) are read back and compared byte
+for byte with the frame before's. `frame_probe.csv` in the log folder has each frame's id, the
+game's eye buffer, the blocks' hash and the share of bytes that changed; the log says every 10 s
+how many frames were the same picture as the one before, and how many of those were black. The
+first frame of every run of identical pictures is also saved (`probe_<frame>.ppm`).
+
+Level 1, native 120 at 120 Hz, the head held still by the script:
+
+- The title screen: about 900 of every 1,200 frames are the same picture as the one before (it
+  hardly moves), which shows the probe finds repeats where there are any.
+- Inside the level: every frame differed from the one before, except for runs of 26 to 28
+  frames about every 8.8 s. Those are entirely black (every colour value 0): the scripted walk takes
+  Astro off the edge and the game fades to black while it puts him back. The game draws each
+  of them into the next of its three eye buffers in turn (never the same buffer twice in a
+  row), so it is the game's fade, not a frame handed over again.
+- Between consecutive frames that were not both black, a median of 6% of the sampled bytes
+  changed, at least 1.2% in 99% of the pairs, and never none (the least was 0.02%, in a fade).
+
+World 3-3 and 3-4 the same: every picture that was the same as the one before was black (fades
+of 28 to 38 frames when Astro is put back, and one black screen of 363 frames, 3 s, in 3-3), each
+drawn into the next eye buffer. (The black test looks at colour only: the game's black is opaque.)
+
+So at 120 the game simulates and draws a new picture for every refresh; none is a repeat of the
+one before, by the game or by the emulator, apart from pictures that are black.
+
+### Parallel texture copies (PARALLEL_COPY)
+
+The hitch in level 1 (section 11, item 2) is new scenery coming into view: with a warm pipeline
+cache, about a quarter of the GPU command thread's 100 busiest milliseconds went to copying the
+new textures out of the game's memory into the staging memory the GPU reads from (one
+`memcpy`), and some 14% to waiting for the GPU because the copies came with more submissions
+than the eight that may be in flight. Copies of a megabyte or more are now split over five
+worker threads and the GPU command thread (`SHADPS4_PERF_PARALLEL_COPY=0` turns it off). The
+longest run of repeated pictures at that moment went from 11 and 9 pictures to 8 and 7 (two
+runs each). Allowing 16 submissions in flight instead of 8 (`SHADPS4_VK_IN_FLIGHT=16`) did not
+help and is left at 8.
+
+### The window's frame counter shows the game's rate
+
+With the window updated at most 60 times a second, its "FPS" counter counted the window's
+pictures. It now shows the game's own frames a second (`sceGnmSubmitDone`, over half a
+second), and the window's rate only while the game hands in no frames.
+
+### The world select
+
+The world select (the space scene with the planets) is heavier than the levels: 114 to 118
+frames a second at 120 Hz, the GPU command thread at 7.7 to 8.1 ms of processor time a frame
+(5 to 6 ms in the levels) and the GPU 58 to 59% busy. That thread is what limits it there.
+
+### An open crash
+
+One run in about twenty since these changes crashed on the GPU command thread in
+`SpecInputKey` (the shader permutation memo), writing into a local vector whose own header had
+been overwritten: something had corrupted memory before. Two repeats of the same test did not
+crash. Not yet explained; if it shows up again, `SHADPS4_PERF_PARALLEL_COPY=0` and
+`SHADPS4_PERF_SPEC_MEMO=0` are the first things to try.
+
 ### Measuring on a PC that is in use
 
 The same build and settings gave 28% GPU load and 0.30 repeated pictures a second in level 1 at
@@ -716,6 +780,7 @@ them off, and a switch named on its own wins over `ALL`.
 | `PRECISE_SLEEP` | on | this work | one high-resolution waitable timer per thread for sleeps |
 | `STREAM_MEMO` | on | this work | reuse of stream-buffer copies of the same data |
 | `SUBMIT_OVERLAP` | **off** | this work | the next frame may be submitted before the GPU thread is idle (`=1` to try) |
+| `PARALLEL_COPY` | on | this work | copies of a megabyte or more from the game's memory (texture uploads) split over threads |
 
 ### Settings added in this work
 
@@ -733,6 +798,8 @@ them off, and a switch named on its own wins over `ALL`.
 | `SHADPS4_BENCH_STREAM` | off | `1`: the `Bench:` line's stream-repeat analysis (costs GPU thread time) |
 | `SHADPS4_XR_LATE_WAIT_MS` | 3 | how long the headset thread waits for a frame that is about to arrive, 0 to 6 |
 | `SHADPS4_VR_WINDOW_FPS` | 60 | most frames a second for the desktop window while a headset of this PC shows every frame; 0: none |
+| `SHADPS4_VR_FRAME_PROBE` | off | `1`: compare every frame's picture with the one before (`frame_probe.csv`, log line, `probe_<frame>.ppm`) |
+| `SHADPS4_VK_IN_FLIGHT` | 8 | submissions to the GPU in flight before the next waits, 2 to 64 |
 | `OPENXR_SIM_REFRESH_HZ` | 90 | OpenXR Simulator only: its refresh rate, 30 to 500 |
 
 ### Settings used above that existed before
