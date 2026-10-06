@@ -47,6 +47,94 @@ const volatile u64* stack_limit_field = nullptr;
 // Nothing here may allocate: the stopped thread may hold the heap's lock. Nothing may fault
 // either (the emulator's exception handler takes any fault it does not know for a crash): the
 // walk stops at a stack pointer outside the thread's stack.
+// Whether undoing this function's frame reads only the stack: RtlVirtualUnwind reads saved
+// registers and the return address at offsets its unwind data gives, from the stack pointer or
+// from a frame register, and a frame it got wrong would make it read anywhere. The frame's whole
+// size and its farthest saved register are worked out from the unwind codes (following chained
+// entries) and must lie within the stack; anything unusual ends the walk instead.
+bool UnwindStaysOnStack(const CONTEXT& context, u64 image_base, const RUNTIME_FUNCTION* entry,
+                        u64 stack_base, u64 stack_limit) {
+    u64 frame_size = 8; // the return address
+    u64 farthest_save = 0;
+    u64 establisher = context.Rsp;
+    bool first = true;
+    for (int chain = 0; chain < 8; ++chain) {
+        const auto* info = reinterpret_cast<const u8*>(image_base + entry->UnwindData);
+        const u8 version = info[0] & 7;
+        const u8 flags = info[0] >> 3;
+        const u8 prolog_size = info[1];
+        const u8 count = info[2];
+        const u8 frame_register = info[3] & 15;
+        const u8 frame_offset = info[3] >> 4;
+        if (version != 1 && version != 2) {
+            return false;
+        }
+        const auto* codes = info + 4;
+        const u64 rip_offset = context.Rip - (image_base + entry->BeginAddress);
+        if (first && frame_register != 0 && rip_offset >= prolog_size) {
+            establisher = (&context.Rax)[frame_register] - u64{frame_offset} * 16;
+        }
+        for (u32 i = 0; i < count;) {
+            const u8 op = codes[i * 2 + 1] & 15;
+            const u8 op_info = codes[i * 2 + 1] >> 4;
+            const auto slot = [&](u32 n) {
+                return u64{codes[(i + n) * 2]} | (u64{codes[(i + n) * 2 + 1]} << 8);
+            };
+            switch (op) {
+            case 0: // UWOP_PUSH_NONVOL
+                frame_size += 8;
+                i += 1;
+                break;
+            case 1: // UWOP_ALLOC_LARGE
+                if (op_info == 0) {
+                    frame_size += slot(1) * 8;
+                    i += 2;
+                } else {
+                    frame_size += slot(1) | (slot(2) << 16);
+                    i += 3;
+                }
+                break;
+            case 2: // UWOP_ALLOC_SMALL
+                frame_size += u64{op_info} * 8 + 8;
+                i += 1;
+                break;
+            case 3: // UWOP_SET_FPREG
+                i += 1;
+                break;
+            case 4: // UWOP_SAVE_NONVOL
+                farthest_save = std::max(farthest_save, slot(1) * 8 + 8);
+                i += 2;
+                break;
+            case 5: // UWOP_SAVE_NONVOL_FAR
+                farthest_save = std::max(farthest_save, (slot(1) | (slot(2) << 16)) + 8);
+                i += 3;
+                break;
+            case 6: // UWOP_EPILOG (version 2)
+                i += 2;
+                break;
+            case 8: // UWOP_SAVE_XMM128
+                farthest_save = std::max(farthest_save, slot(1) * 16 + 16);
+                i += 2;
+                break;
+            case 9: // UWOP_SAVE_XMM128_FAR
+                farthest_save = std::max(farthest_save, (slot(1) | (slot(2) << 16)) + 16);
+                i += 3;
+                break;
+            default: // UWOP_PUSH_MACHFRAME and anything unknown
+                return false;
+            }
+        }
+        if ((flags & UNW_FLAG_CHAININFO) == 0) {
+            break;
+        }
+        entry = reinterpret_cast<const RUNTIME_FUNCTION*>(codes + ((count + 1) & ~1u) * 2);
+        first = false;
+    }
+    const u64 reach = std::max(frame_size, farthest_save);
+    return (establisher & 7) == 0 && establisher >= stack_limit &&
+           establisher + reach + 64 <= stack_base;
+}
+
 u32 WalkBounded(CONTEXT context, std::array<u64, MaxDepth>& pcs, u64 stack_base, u64 stack_limit) {
     const auto on_stack = [&](u64 sp) {
         return (sp & 7) == 0 && sp >= stack_limit && sp + 256 <= stack_base;
@@ -67,6 +155,9 @@ u32 WalkBounded(CONTEXT context, std::array<u64, MaxDepth>& pcs, u64 stack_base,
             context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
             context.Rsp += 8;
             continue;
+        }
+        if (!UnwindStaysOnStack(context, image_base, entry, stack_base, stack_limit)) {
+            break;
         }
         PVOID handler_data = nullptr;
         DWORD64 establisher = 0;
@@ -181,7 +272,8 @@ bool IsWait(const std::string& name) {
 // lock, copying memory, or running in the graphics driver (whose functions have no symbols and
 // show up as the nearest export of its module).
 const char* SinkOf(const std::string& name) {
-    static constexpr std::array<std::pair<const char*, const char*>, 14> sinks{{
+    static constexpr std::array<std::pair<const char*, const char*>, 15> sinks{{
+        {"SpinLock::lock", "spin"},
         {"RtlAllocateHeap", "allocate"}, {"RtlFreeHeap", "free"}, {"malloc", "allocate"},
         {"operator new", "allocate"}, {"free_base", "free"}, {"RtlAcquireSRW", "lock"},
         {"Mtx_lock", "lock"}, {"RtlReleaseSRW", "lock"}, {"_NLG_Return", "memcpy"},

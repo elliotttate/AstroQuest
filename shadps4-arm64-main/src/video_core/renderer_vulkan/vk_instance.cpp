@@ -435,10 +435,25 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // OpenXR may wait for its compositor while externally synchronizing the bound queue.
+    // SHADPS4_XR_SHARED_QUEUE=0 gives it another queue in the same family, so that such a wait
+    // cannot block game submissions. Off by default: measured against an OpenXR runtime that
+    // never made the lock wait (the OpenXR Simulator, 90 Hz, first level), the separate queue
+    // had the headset show fewer of the frames the game delivered (67-76 a second instead of
+    // 84-87); whether it helps with Virtual Desktop's runtime is not measured yet.
+    headset_queue_index = 0;
+#ifdef ENABLE_OPENXR_HOST
+    const char* shared_queue = std::getenv("SHADPS4_XR_SHARED_QUEUE");
+    if (Core::Vr::OpenXrHost::Instance().IsAvailable() &&
+        family_properties[queue_family_index].queueCount > 1 && shared_queue != nullptr &&
+        shared_queue[0] == '0') {
+        headset_queue_index = 1;
+    }
+#endif
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = headset_queue_index + 1,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -704,6 +719,7 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    headset_queue = device->getQueue(queue_family_index, headset_queue_index);
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

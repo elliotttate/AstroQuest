@@ -514,12 +514,67 @@ function Test-Runtime {
     return $true
 }
 
+# --- the headset's runtime ----------------------------------------------------------------------
+# The OpenXR runtimes this PC has, by the names runtime= in the settings uses: Virtual Desktop's
+# VDXR, SteamVR, Meta Quest Link. "default" is whatever Windows has as its active runtime. The
+# choice is the game's alone (XR_RUNTIME_JSON for the emulator): Windows' own stays as it is.
+$runtimeNames = [ordered]@{
+    "default"        = "Windows' choice"
+    "virtualdesktop" = "Virtual Desktop (VDXR)"
+    "steamvr"        = "SteamVR"
+    "meta"           = "Meta Quest Link"
+}
+function Find-Runtimes {
+    $found = [ordered]@{}
+    $candidates = @()
+    foreach ($key in @('HKLM:\SOFTWARE\Khronos\OpenXR\1', 'HKCU:\SOFTWARE\Khronos\OpenXR\1')) {
+        try {
+            $item = Get-ItemProperty $key -ErrorAction Stop
+            if ($item.ActiveRuntime) { $candidates += $item.ActiveRuntime }
+            if ($item.PreviousActiveRuntime) { $candidates += $item.PreviousActiveRuntime }
+        } catch {}
+        try { $candidates += @((Get-Item ($key + '\AvailableRuntimes') -ErrorAction Stop).Property) } catch {}
+    }
+    $candidates += Join-Path $env:ProgramFiles "Virtual Desktop Streamer\OpenXR\virtualdesktop-openxr.json"
+    try {
+        $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath
+        if ($steam) { $candidates += Join-Path $steam "steamapps\common\SteamVR\steamxr_win64.json" }
+    } catch {}
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += Join-Path ${env:ProgramFiles(x86)} "Steam\steamapps\common\SteamVR\steamxr_win64.json"
+    }
+    $candidates += Join-Path $env:ProgramFiles "Meta Horizon\Support\oculus-runtime\oculus_openxr_64.json"
+    $candidates += Join-Path $env:ProgramFiles "Oculus\Support\oculus-runtime\oculus_openxr_64.json"
+    foreach ($path in $candidates) {
+        if (-not $path) { continue }
+        $name = $null
+        if ($path -match 'virtualdesktop-openxr\.json$') { $name = "virtualdesktop" }
+        elseif ($path -match 'steamxr_win64\.json$') { $name = "steamvr" }
+        elseif ($path -match 'oculus_openxr_64\.json$') { $name = "meta" }
+        if ($name -and -not $found.Contains($name) -and [System.IO.File]::Exists($path)) {
+            $found[$name] = $path
+        }
+    }
+    return $found
+}
+# What Windows has as its active runtime, in a few words.
+function Describe-ActiveRuntime {
+    $active = ""
+    try { $active = (Get-ItemProperty 'HKLM:\SOFTWARE\Khronos\OpenXR\1' -ErrorAction Stop).ActiveRuntime } catch {}
+    if (-not $active) { return "none set" }
+    if ($active -match 'virtualdesktop') { return "Virtual Desktop" }
+    if ($active -match 'steamxr') { return "SteamVR" }
+    if ($active -match 'oculus') { return "Meta Quest Link" }
+    return [System.IO.Path]::GetFileNameWithoutExtension($active)
+}
+$installedRuntimes = Find-Runtimes
+
 # --- the window -------------------------------------------------------------------------------
 function Show-Menu {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Astro Bot VR"
-    $form.ClientSize = New-Object System.Drawing.Size(560, 452)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 552)
     $form.StartPosition = "CenterScreen"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
@@ -589,7 +644,7 @@ function Show-Menu {
     $form.Controls.Add($fps)
     $y += 32
     $fpsText = New-Object System.Windows.Forms.Label
-    $fpsText.Text = "A frame lasts a whole number of the headset's refreshes, so the headset's refresh rate decides what is possible: at 120 Hz 120, 60, 40 or 30 frames a second, at 90 Hz 90, 45 or 30, at 72 Hz 72 or 36. Virtual Desktop sets the refresh rate (Settings > Streaming > Frame rate): choose 120 for 60 frames a second."
+    $fpsText.Text = "A frame lasts a whole number of the headset's refreshes, so the headset's refresh rate decides what is possible: at 120 Hz 120, 60, 40 or 30 frames a second, at 90 Hz 90, 45 or 30, at 72 Hz 72 or 36. Virtual Desktop sets the refresh rate (Settings > Streaming > Frame rate): choose 120 for 60 frames a second. In SteamVR it is the headset's refresh rate setting."
     $fpsText.SetBounds(16, $y, 530, 84)
     $form.Controls.Add($fpsText)
     $y += 88
@@ -625,6 +680,32 @@ function Show-Menu {
     & $updateFov
     $y += 46
 
+    # The headset's runtime.
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Headset connection (OpenXR runtime)"
+    $label.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+    $label.SetBounds(16, $y, 520, 20)
+    $form.Controls.Add($label)
+    $y += 24
+    $runtimeChoices = @("default") + @($runtimeNames.Keys | Where-Object { $installedRuntimes.Contains($_) })
+    $runtimeBox = New-Object System.Windows.Forms.ComboBox
+    $runtimeBox.DropDownStyle = "DropDownList"
+    foreach ($choice in $runtimeChoices) {
+        $text = $runtimeNames[$choice]
+        if ($choice -eq "default") { $text = "Windows' choice (" + (Describe-ActiveRuntime) + ")" }
+        [void]$runtimeBox.Items.Add($text)
+    }
+    $runtimeBox.SetBounds(16, $y, 300, 26)
+    $index = [array]::IndexOf($runtimeChoices, (Setting "runtime" "default").ToLower())
+    if ($index -lt 0) { $index = 0 }
+    $runtimeBox.SelectedIndex = $index
+    $form.Controls.Add($runtimeBox)
+    $runtimeText = New-Object System.Windows.Forms.Label
+    $runtimeText.Text = "For this game only; Windows' own setting stays."
+    $runtimeText.SetBounds(326, $y + 4, 220, 40)
+    $form.Controls.Add($runtimeText)
+    $y += 54
+
     $again = New-Object System.Windows.Forms.CheckBox
     $again.Text = "Show this window at every start"
     $again.Checked = (Setting "menu" "1") -ne "0"
@@ -649,6 +730,7 @@ function Show-Menu {
     Save-Setting "resolution" ($widths[$resolution.Value])
     Save-Setting "fps" ($caps[$fps.SelectedIndex])
     Save-Setting "fov" ($fov.Value * 5)
+    Save-Setting "runtime" ($runtimeChoices[$runtimeBox.SelectedIndex])
     Save-Setting "menu" ($(if ($again.Checked) { "1" } else { "0" }))
     Read-Settings
     return $true
@@ -736,6 +818,15 @@ Say "ASTRO BOT Rescue Mission - PC VR" "Cyan"
 if ($env:SHADPS4_TITLE_EYE_WIDTH) {
     Say ("Each eye up to " + $env:SHADPS4_TITLE_EYE_WIDTH + " x " + (EyeHeight ([int]$env:SHADPS4_TITLE_EYE_WIDTH)) + ", at most " + $env:SHADPS4_VR_FPS_CAP + " frames a second.")
 }
+# runtime=: which OpenXR runtime the game uses (an env=XR_RUNTIME_JSON=... line wins over it).
+$runtimeChoice = (Setting "runtime" "default").ToLower()
+if (-not $env:XR_RUNTIME_JSON -and $runtimeChoice -ne "default") {
+    if ($installedRuntimes.Contains($runtimeChoice)) {
+        $env:XR_RUNTIME_JSON = $installedRuntimes[$runtimeChoice]
+    } else {
+        Say ("runtime=" + $runtimeChoice + " is not installed on this PC: using Windows' choice.") "Yellow"
+    }
+}
 $runtime = ""
 if ($env:XR_RUNTIME_JSON) {
     $runtime = $env:XR_RUNTIME_JSON
@@ -747,6 +838,9 @@ if ($runtime -eq "") {
     Say "Virtual Desktop Streamer installs one (Options > OpenXR Runtime: VDXR)."
 } else {
     Say "OpenXR runtime: $runtime"
+    if ($runtime -match "steamxr") {
+        Say "SteamVR: start it with the headset connected before the game. Turn motion smoothing off for steady frames."
+    }
     if ($runtime -match "virtualdesktop") {
         $streamer = Get-Process "VirtualDesktop.Streamer" -ErrorAction SilentlyContinue
         if (-not $streamer) {

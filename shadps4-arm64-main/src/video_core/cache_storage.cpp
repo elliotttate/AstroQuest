@@ -14,6 +14,10 @@
 
 #include <miniz.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -88,6 +92,29 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     }
 }
 
+namespace {
+
+// The build a cache belongs to: the revision, and the program file itself (a build from changes
+// not committed yet has its parent's revision).
+std::string BuildStamp() {
+    std::string stamp = Common::g_scm_rev;
+    std::error_code ec;
+#ifdef _WIN32
+    std::wstring path(32768, L'\0');
+    path.resize(GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())));
+    const std::filesystem::path exe{path};
+#else
+    const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+#endif
+    const auto size = std::filesystem::file_size(exe, ec);
+    const auto time = std::filesystem::last_write_time(exe, ec);
+    stamp += fmt::format(" {} {}", ec ? 0 : size,
+                         ec ? 0 : static_cast<long long>(time.time_since_epoch().count()));
+    return stamp;
+}
+
+} // namespace
+
 void DataBase::Open() {
     if (opened) {
         return;
@@ -108,7 +135,8 @@ void DataBase::Open() {
             const auto file = IOFile{stamp_path, FileAccessMode::Read};
             stamp = file.ReadString(file.GetSize());
         }
-        if (stamp != Common::g_scm_rev) {
+        const std::string build = BuildStamp();
+        if (stamp != build) {
             std::error_code ec;
             std::filesystem::remove_all(cache_dir / game_info.GameSerial(), ec);
             std::filesystem::remove(
@@ -116,10 +144,10 @@ void DataBase::Open() {
                 ec);
             std::filesystem::create_directories(cache_dir, ec);
             const auto file = IOFile{stamp_path, FileAccessMode::Create};
-            file.WriteString(std::string_view{Common::g_scm_rev});
+            file.WriteString(std::string_view{build});
             LOG_INFO(Render, "Pipeline cache {}: made by build {}",
                      stamp.empty() ? "started" : "thrown away, it was made by another build",
-                     Common::g_scm_rev);
+                     build);
         }
     }
     if (EmulatorSettings.IsPipelineCacheArchived()) {

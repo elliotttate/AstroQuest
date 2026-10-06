@@ -31,6 +31,15 @@ void CountEmulatedInstruction();
 /// A shader permutation was looked up through the memo of GetProgram: found there or not.
 void CountSpecMemo(bool hit);
 
+/// A read-only guest buffer was copied into the stream buffer (by the GPU command thread),
+/// while the command buffer with the given tick was being recorded. Counts how much, and how much
+/// of it repeated a copy made before in the same command list of the title or the same command
+/// buffer. Only with SHADPS4_BENCH.
+void CountStreamCopy(u64 address, u32 size, u64 tick);
+
+/// The GPU command thread started on another command list of the title.
+void OnCommandList();
+
 /// Something was compiled on the GPU command thread: a shader module or a pipeline.
 void CountShaderCompile(std::chrono::steady_clock::duration took);
 void CountPipelineCompile(std::chrono::steady_clock::duration took);

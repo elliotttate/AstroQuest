@@ -10,6 +10,7 @@
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
+#include "core/bench_stats.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -432,6 +433,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
+        Core::Bench::CountStreamCopy(device_addr, size, scheduler.CurrentTick());
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
         return {&stream_buffer, offset};
     }

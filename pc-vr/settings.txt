@@ -89,6 +89,12 @@
 # 0: do not look for a headset at all, play on the monitor.
 #headset=1
 
+# Which OpenXR runtime connects the headset, for this game only (Windows' own choice stays):
+# default (whatever Windows has as its active OpenXR runtime), virtualdesktop (Virtual Desktop
+# Streamer's VDXR), steamvr (SteamVR: start it with the headset connected first, and turn motion
+# smoothing off) or meta (Meta Quest Link). The window at the start offers the ones this PC has.
+#runtime=default
+
 # Where the game is, if it is not in the games folder next to this one: its eboot.bin, its
 # folder, or its .pkg package (which is then unpacked into the games folder). The launcher
 # writes this line itself when it has to ask where the game is.

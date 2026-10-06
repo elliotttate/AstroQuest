@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <unordered_set>
 #include <atomic>
 #include <cstdlib>
 #include <vector>
@@ -28,6 +30,21 @@ std::atomic<u64> pipeline_compile_ns{0};
 std::atomic<void*> gpu_thread{nullptr};
 std::atomic<u64> spec_memo_hits{0};
 std::atomic<u64> spec_memo_misses{0};
+
+// Stream copies (written by the GPU command thread only).
+std::atomic<u64> stream_copies{0};
+std::atomic<u64> stream_bytes{0};
+std::atomic<u64> stream_repeats_list{0};
+std::atomic<u64> stream_repeat_bytes_list{0};
+std::atomic<u64> stream_repeats_tick{0};
+std::atomic<u64> stream_repeat_bytes_tick{0};
+std::unordered_set<u64> stream_seen_list;
+std::unordered_set<u64> stream_seen_tick;
+u64 stream_seen_tick_value = ~u64{0};
+
+void Bump(std::atomic<u64>& counter, u64 by) {
+    counter.store(counter.load(std::memory_order_relaxed) + by, std::memory_order_relaxed);
+}
 
 double Period() {
     static const double period = [] {
@@ -71,6 +88,15 @@ u64 Tsc() {
 }
 #endif
 
+std::array<u64, 6> StreamCounters() {
+    return {stream_copies.load(std::memory_order_relaxed),
+            stream_bytes.load(std::memory_order_relaxed),
+            stream_repeats_list.load(std::memory_order_relaxed),
+            stream_repeat_bytes_list.load(std::memory_order_relaxed),
+            stream_repeats_tick.load(std::memory_order_relaxed),
+            stream_repeat_bytes_tick.load(std::memory_order_relaxed)};
+}
+
 struct Window {
     Clock::time_point start;
     Clock::time_point last_frame;
@@ -84,6 +110,7 @@ struct Window {
     u64 pipeline_ns{};
     u64 memo_hits{};
     u64 memo_misses{};
+    std::array<u64, 6> stream{};
     std::vector<double> frames;
 
     void Begin(Clock::time_point now) {
@@ -98,6 +125,7 @@ struct Window {
         pipeline_ns = pipeline_compile_ns.load(std::memory_order_relaxed);
         memo_hits = spec_memo_hits.load(std::memory_order_relaxed);
         memo_misses = spec_memo_misses.load(std::memory_order_relaxed);
+        stream = StreamCounters();
         frames.clear();
     }
 };
@@ -122,8 +150,37 @@ void CountEmulatedInstruction() {
     emulated_instructions.fetch_add(1, std::memory_order_relaxed);
 }
 
+void CountStreamCopy(u64 address, u32 size, u64 tick) {
+    if (!Enabled()) {
+        return;
+    }
+    const u64 key = address * 0x9E3779B97F4A7C15ULL ^ size;
+    Bump(stream_copies, 1);
+    Bump(stream_bytes, size);
+    if (!stream_seen_list.insert(key).second) {
+        Bump(stream_repeats_list, 1);
+        Bump(stream_repeat_bytes_list, size);
+    }
+    if (tick != stream_seen_tick_value) {
+        stream_seen_tick.clear();
+        stream_seen_tick_value = tick;
+    }
+    if (!stream_seen_tick.insert(key).second) {
+        Bump(stream_repeats_tick, 1);
+        Bump(stream_repeat_bytes_tick, size);
+    }
+}
+
+void OnCommandList() {
+    if (Enabled()) {
+        stream_seen_list.clear();
+    }
+}
+
 void CountSpecMemo(bool hit) {
-    (hit ? spec_memo_hits : spec_memo_misses).fetch_add(1, std::memory_order_relaxed);
+    // Only the GPU command thread counts these: a plain increment, not a locked one.
+    auto& counter = hit ? spec_memo_hits : spec_memo_misses;
+    counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 void CountShaderCompile(Clock::duration took) {
@@ -193,18 +250,27 @@ void OnFrame() {
     const u64 pipeline_ns = pipeline_compile_ns.load(std::memory_order_relaxed) - window.pipeline_ns;
     const u64 memo_hits = spec_memo_hits.load(std::memory_order_relaxed) - window.memo_hits;
     const u64 memo_misses = spec_memo_misses.load(std::memory_order_relaxed) - window.memo_misses;
+    auto stream = StreamCounters();
+    for (size_t i = 0; i < stream.size(); ++i) {
+        stream[i] -= window.stream[i];
+    }
+    const auto pct = [](u64 part, u64 whole) { return whole ? 100.0 * part / whole : 0.0; };
     LOG_INFO(Core,
              "Bench: {} frames in {:.2f} s ({:.1f} a second); frame ms avg {:.2f} p99 {:.2f} max "
              "{:.1f}; over 25 ms {}, over 50 ms {}, over 100 ms {}; CPU ms a frame: GPU thread "
              "{:.3f}, process {:.3f}; SSE4a emulated {} ({:.1f} a frame); compiled {} shaders "
-             "({:.1f} ms) and {} pipelines ({:.1f} ms); shader memo {:.1f}% of {} lookups",
+             "({:.1f} ms) and {} pipelines ({:.1f} ms); shader memo {:.1f}% of {} lookups; stream "
+             "copies {:.0f} a frame, {:.0f} KB a frame, repeated in a command list {:.0f}% ({:.0f}% "
+             "of bytes), in a command buffer {:.0f}% ({:.0f}% of bytes)",
              frames, elapsed, frames / elapsed, frames ? sum / frames : 0.0, p99, longest, over25,
              over50, over100, per_frame_ms(gpu, window.gpu_cycles),
              per_frame_ms(process, window.process_cycles), emulated,
              frames ? double(emulated) / frames : 0.0, shaders, shader_ns / 1e6, pipelines,
              pipeline_ns / 1e6,
              memo_hits + memo_misses ? 100.0 * memo_hits / double(memo_hits + memo_misses) : 0.0,
-             memo_hits + memo_misses);
+             memo_hits + memo_misses, frames ? double(stream[0]) / frames : 0.0,
+             frames ? stream[1] / 1024.0 / frames : 0.0, pct(stream[2], stream[0]),
+             pct(stream[3], stream[1]), pct(stream[4], stream[0]), pct(stream[5], stream[1]));
     window.Begin(now);
     window.last_frame = now;
 }

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <ranges>
 #include "common/assert.h"
+#include "common/perf_toggles.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -381,16 +382,24 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         SetBackingSamples(info.num_samples);
     }
+    static const bool view_memo = Common::PerfToggle("VIEW_MEMO");
+    if (view_memo && backing->last_view_valid && backing->last_view_info == view_info) {
+        return (*slot_image_views)[backing->last_view_id];
+    }
     EnsureViewFormat(ImageView::HostFormat(*instance, view_info, *this));
     const auto& view_infos = backing->image_view_infos;
     const auto it = std::ranges::find(view_infos, view_info);
+    ImageViewId view_id;
     if (it != view_infos.end()) {
-        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
-        return (*slot_image_views)[view_id];
+        view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
+    } else {
+        view_id = slot_image_views->insert(*instance, view_info, *this);
+        backing->image_view_infos.emplace_back(view_info);
+        backing->image_view_ids.emplace_back(view_id);
     }
-    const auto view_id = slot_image_views->insert(*instance, view_info, *this);
-    backing->image_view_infos.emplace_back(view_info);
-    backing->image_view_ids.emplace_back(view_id);
+    backing->last_view_info = view_info;
+    backing->last_view_id = view_id;
+    backing->last_view_valid = true;
     return (*slot_image_views)[view_id];
 }
 

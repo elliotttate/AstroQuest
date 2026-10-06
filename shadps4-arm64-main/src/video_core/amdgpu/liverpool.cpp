@@ -310,6 +310,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 }
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+    Core::Bench::OnCommandList();
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
