@@ -55,7 +55,10 @@ config["General"].update({"addon_install_dir": "", "font_dir": "", "home_dir": "
                           "install_dirs": [], "sys_modules_dir": "", "shadnet_server": ""})
 config["Input"].update({"default_controller_id": "", "camera_id": -1,
                         "motion_controls_enabled": True, "background_controller_input": True})
-config["Vulkan"].update({"gpu_id": -1, "vkvalidation_enabled": False, "renderdoc_enabled": False})
+config["Vulkan"].update({"gpu_id": -1, "vkvalidation_enabled": False, "renderdoc_enabled": False,
+                         # The pipelines the game used are kept and made again as the emulator
+                         # starts: no stutter the second time an effect shows up.
+                         "pipeline_cache_enabled": True})
 config["Log"].update({"type": "file", "sync": False, "filter": "*:Info", "append": False})
 for key in [k for k in config["Audio"] if k.endswith("_device")]:
     config["Audio"][key] = "Default Device"

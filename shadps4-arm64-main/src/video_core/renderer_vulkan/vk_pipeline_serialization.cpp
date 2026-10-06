@@ -142,6 +142,16 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
+// A pipeline whose descriptor layout depends on the title's image sharps (an image whose mips
+// the shader indexes: a binding for each) cannot be made before the title runs: it is not
+// preloaded but compiled when the title first uses it. (Reading the sharps as the emulator
+// starts read the title's memory before there was any.)
+static bool UsesSharpsToLayOut(const Shader::Info& info) {
+    return std::ranges::any_of(info.images, [](const Shader::ImageResource& image) {
+        return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+    });
+}
+
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     compute_key.Deserialize(ar);
 
@@ -158,6 +168,11 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
     if (!LoadPipelineStage(meta_ar, 0)) {
+        return false;
+    }
+    if (UsesSharpsToLayOut(*infos[0])) {
+        infos.fill(nullptr);
+        modules.fill(nullptr);
         return false;
     }
 
@@ -249,6 +264,15 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
                     vs_info->pgm_hash);
         infos.fill(nullptr);
         modules.fill(nullptr);
+        return false;
+    }
+
+    if (std::ranges::any_of(infos, [](const Shader::Info* info) {
+            return info != nullptr && UsesSharpsToLayOut(*info);
+        })) {
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        preload_fetch_shader.reset();
         return false;
     }
 

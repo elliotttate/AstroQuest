@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -331,6 +332,8 @@ struct OpenXrHost::Impl {
 
     // The title's frames on their way here.
     std::mutex slot_mutex;
+    // Told when a frame has been handed over (EndFrame).
+    std::condition_variable delivered_cv;
     std::array<Slot, NumSlots> slots;
     s32 latest{-1};
     u32 next_slot{};
@@ -417,6 +420,9 @@ struct OpenXrHost::Impl {
     // Pictures that showed the same frame as the one before (the title's frame was not there
     // in time), and the most of them in a row.
     u32 repeated_pictures{};
+    // Pictures whose frame came only after the headset had asked for the picture, and was
+    // waited for (SHADPS4_XR_LATE_WAIT_MS).
+    u32 late_pictures{};
     u32 repeat_run{};
     u32 longest_repeat_run{};
     // How long frames waited between being handed over and being taken, for the log.
@@ -1533,7 +1539,41 @@ struct OpenXrHost::Impl {
 
             bool new_picture = false;
             double picture_wait = 0.0;
-            if (const s32 index = TakeFrame(); index >= 0) {
+            s32 taken = TakeFrame();
+            // SHADPS4_XR_LATE_WAIT_MS=<ms> (3; 0 for none): when the title's next frame is not
+            // there yet but frames are coming, it is waited for so long before the picture is
+            // made, instead of showing the last frame again (and the late one never, as the
+            // one after it comes in time for the next picture). The picture is still handed to
+            // the runtime well before its display is due: a title of its own draws for most of
+            // the refresh before it does.
+            static const float late_wait_ms =
+                std::clamp(EnvFloat("SHADPS4_XR_LATE_WAIT_MS", 3.0f), 0.0f, 6.0f);
+            if (taken < 0 && late_wait_ms > 0.0f && have_frame &&
+                frame_state.shouldRender == XR_TRUE && refresh_rate > 30.0f) {
+                const auto period = std::chrono::duration<double>(1.0 / refresh_rate);
+                bool expected;
+                {
+                    std::scoped_lock lock{slot_mutex};
+                    expected = last_delivery != Clock::time_point{} &&
+                               woke - last_delivery < 2 * period;
+                }
+                if (expected) {
+                    const auto until =
+                        woke + std::chrono::duration_cast<Clock::duration>(
+                                   std::chrono::duration<double, std::milli>(late_wait_ms));
+                    {
+                        std::unique_lock lock{slot_mutex};
+                        delivered_cv.wait_until(lock, until, [this] {
+                            return latest >= 0 && slots[latest].state == Slot::State::Ready;
+                        });
+                    }
+                    taken = TakeFrame();
+                    if (taken >= 0) {
+                        ++late_pictures;
+                    }
+                }
+            }
+            if (const s32 index = taken; index >= 0) {
                 const auto started = Clock::now();
                 bool blank = false;
                 const bool copied = CopyFrame(static_cast<u32>(index), blank);
@@ -2265,11 +2305,12 @@ struct OpenXrHost::Impl {
         }
         LOG_INFO(Core_Vr,
                  "Headset pictures: {} of {} repeated the frame before ({:.1f} a second, at most "
-                 "{} in a row), {} frames were never shown (a newer one came first); frames "
-                 "waited {:.2f} ms on average to be taken ({:.2f} at worst)",
+                 "{} in a row), {} frames were never shown (a newer one came first), {} came "
+                 "late and were waited for; frames waited {:.2f} ms on average to be taken "
+                 "({:.2f} at worst)",
                  repeated_pictures, display_frames, static_cast<float>(repeated_pictures) / seconds,
-                 longest_repeat_run, skipped, copied_frames != 0 ? wait_sum / copied_frames * 1e3 : 0.0,
-                 wait_worst * 1e3);
+                 longest_repeat_run, skipped, late_pictures,
+                 copied_frames != 0 ? wait_sum / copied_frames * 1e3 : 0.0, wait_worst * 1e3);
         if (frame_log != nullptr) {
             std::fflush(frame_log);
         }
@@ -2356,6 +2397,7 @@ struct OpenXrHost::Impl {
         display_frames = 0;
         copied_frames = 0;
         repeated_pictures = 0;
+        late_pictures = 0;
         longest_repeat_run = 0;
         wait_sum = 0.0;
         wait_worst = 0.0;
@@ -2670,6 +2712,7 @@ void OpenXrHost::EndFrame(u32 index, const PresentedFrame& info, vk::Semaphore r
     slot.delivered = Clock::now();
     impl->latest = static_cast<s32>(index % NumSlots);
     impl->delivered_frames.fetch_add(1, std::memory_order_relaxed);
+    impl->delivered_cv.notify_all();
     const auto now = Clock::now();
     if (impl->last_delivery != Clock::time_point{}) {
         const double gap = std::chrono::duration<double>(now - impl->last_delivery).count();

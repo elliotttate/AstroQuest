@@ -26,6 +26,7 @@ All numbers on this page were measured. Nothing here is an estimate unless it sa
 - [10. Measurement tools](#10-measurement-tools)
 - [11. Open findings](#11-open-findings)
 - [12. Reproducing the measurements](#12-reproducing-the-measurements)
+- [13. Late frames, more levels and the pipeline cache](#13-late-frames-more-levels-and-the-pipeline-cache)
 - [Reference: environment variables](#reference-environment-variables)
 - [Reference: where the code is](#reference-where-the-code-is)
 
@@ -35,9 +36,15 @@ All numbers on this page were measured. Nothing here is an estimate unless it sa
   game has a 60/90/120 fps option that the retail build locks to 60. The emulator unlocks it.
   At 120 the game simulates and renders a new frame for every refresh of the headset, instead
   of rendering 60 and having each one shown twice.
-- On the test PC (i9-13900KF, RTX 5090) the first level runs at **119.8 frames a second**, and
-  **about 99.4% of the pictures the headset shows are new frames** (0.75 repeated pictures a
-  second). Before this work the same PC managed about 100.
+- On the test PC (i9-13900KF, RTX 5090) five levels run at **119.5 to 120 frames a second**
+  (World 1-1 and World 3-1 to 3-4). In the first level, at best **99.75% of the pictures the
+  headset shows are new frames** (0.30 repeated pictures a second, half of them from one
+  hitch); with the PC's monitor on and other programs open it was 0.5 to 0.9 a second. Before
+  this work the same PC managed about 100 frames a second. See
+  [section 13](#13-late-frames-more-levels-and-the-pipeline-cache).
+- **The pipeline cache works now and the release turns it on.** The game's pipelines are kept
+  between sessions and made again as the emulator starts, so effects no longer stutter the
+  first time they appear in a session. (It used to crash the second start: see section 13.)
 - Set Virtual Desktop to 120 Hz (Streaming > Frame rate) to use `fps=120`.
 - `native_rate=0` in `settings.txt` turns the native mode off. The game then stays in its 60 fps
   mode and is driven twice as fast instead (about 112 frames a second on the test PC, with
@@ -46,8 +53,9 @@ All numbers on this page were measured. Nothing here is an estimate unless it sa
   counts in frames (some animated signs) run faster.
 - The game's 90 fps mode is supported by the patch but has not been measured yet. The launcher
   only turns the native mode on for `fps=120`.
-- At 120 fps the RTX 5090 is only 28 to 35% busy. What limits the frame rate is the emulator's
-  processor work, not the graphics card.
+- At 120 fps the RTX 5090 is 28 to 35% busy in the first level with the monitor asleep, and
+  45 to 50% with a 4K monitor on (up to about 80% in the heaviest World 3 level). What limits
+  the frame rate is mostly the emulator's processor work and the evenness of frame delivery.
 - Every change on this page can be switched off with an `env=NAME=value` line in
   `settings.txt` (see [Reference: environment variables](#reference-environment-variables)). If
   something looks wrong after an update, `env=SHADPS4_PERF_ALL=0` turns all the switchable
@@ -497,13 +505,16 @@ The stream-repeat analysis needs `SHADPS4_BENCH_STREAM=1`.
 
 None of these are solved. They are where to look next.
 
-1. **The remaining repeated pictures (about 0.75 a second at 120 Hz) come from the game's side.**
-   About every 2.08 s (250 frames at 120 fps), one frame's submission grows from about 6 ms to
-   11 to 12 ms. Submission here is the time from its first command list to `SubmitDone`. A few
-   slower frames follow. This is being profiled (`SHADPS4_FRAME_STATS_CSV`,
-   `SHADPS4_PROFILE_THREADS`, `SHADPS4_PROFILE_RAW`).
-2. **One hitch at the same moment of the level-1 walk in every run.** For about 120 to 150 ms
-   no new frame reaches the headset. In `xr_frames.csv` it is at about 93 s into the run.
+1. **Repeated pictures.** Now mostly handled by the late-frame wait (section 13). In one set of
+   runs the late frames came about every 2.08 s (250 frames at 120 fps), when one frame's
+   submission grew from about 6 ms to 11 to 12 ms; in the slow frames the game's DrawThread
+   spent 55% of its time waiting for the emulator's GPU command thread to go idle
+   (`sceGnmSubmitCommandBuffersForWorkload`). With that wait removed (SUBMIT_OVERLAP) the
+   pattern changed but the count did not.
+2. **One hitch at the same moment of the level-1 walk in every run** (as the scripted head turn
+   brings new scenery into view): for 75 to 150 ms no new frame reaches the headset. It is not a
+   pipeline compile (it stays with a warm cache); the GPU command thread does about 90 ms of
+   work for one frame there.
 3. **Where the GPU command thread's time goes at 120 fps** (40 s profile):
    - the thread is about 76% busy;
    - the NVIDIA driver is about 13.5% of the samples: push descriptors about 6.7%, draws about
@@ -518,8 +529,8 @@ None of these are solved. They are where to look next.
    - `L1` to `L25` are the levels of Worlds 1 to 5.
 
    [make_save.py](../tools/re/astro-bot/make_save.py) builds saves with Worlds 1 and 2, or all
-   five worlds, cleared. The same notes give the directions of the planets in the world select,
-   for writing input scripts. No other level has been measured yet.
+   five worlds, cleared. Four World 3 levels are now measured (section 13).
+   - The world select itself runs at 99 to 114 fps at 120 Hz: heavier than the levels.
 5. **Starting a level directly does not work.** The game reads `/app0/args.txt`.
    - `-level` only replaces the first room request, which in the retail flow is the world
      select, not a level.
@@ -586,13 +597,111 @@ python tools/bench/xrframes.py build/pc-bench/native120/xr_frames.csv
 Arguments after the run count are `NAME=value` environment variables for the emulator (and for
 the OpenXR runtime it loads, like `OPENXR_SIM_REFRESH_HZ`).
 
+## 13. Late frames, more levels and the pipeline cache
+
+### The headset waits for a late frame (SHADPS4_XR_LATE_WAIT_MS)
+
+The per-picture log showed that each remaining repeated picture came from one frame that
+reached the headset thread a few milliseconds after it had already taken its picture: that
+picture showed the frame before again, and the late frame was then overtaken by the next one
+and never shown. The game itself handed its frames in evenly (99th percentile 9.2 ms, longest
+usually under 10 to 13 ms); the variation is in the way from the game's hand-over to a finished
+picture (the GPU command thread catching up, the GPU, the present thread's looks).
+
+Now, when the headset's runtime asks for a picture and the next frame is not there yet but the
+game delivered one within the last two refreshes, the headset thread waits up to 3 ms for it
+(`SHADPS4_XR_LATE_WAIT_MS`, 0 to 6, 0 turns it off). The picture still goes to the runtime
+early in the refresh: an ordinary PC VR game draws for most of the refresh before it hands its
+picture over. The "Headset pictures" log line counts the frames that were waited for.
+
+Level 1, 120 Hz, native 120, measured from 85 s on:
+
+| | repeated pictures/s | frames never shown | shown/s |
+| --- | --- | --- | --- |
+| without the wait (delivery phase 0.35) | 0.75 to 1.00 | 37 to 71 | 119.0 to 119.3 |
+| with the 3 ms wait | **0.30** | 13 | **119.7** |
+
+14 to 29 frames in every 10 s were late and waited for. Of the 25 repeated pictures left in that
+run, 14 are one hitch (section 11, item 2); the rest is about one picture in seven seconds.
+
+### Five levels
+
+With `make_save.py`'s all-worlds save the world select opens on World 3; X opens level 3-1, and
+each push of the left stick to the left moves on by one level (3-2, 3-3, 3-4, then the boss).
+`tools/bench/world3-1-walk.txt` to `world3-4-walk.txt` do that and then walk Astro forward
+(`SAVE=build/pc-bench/save-all`, `FROM_WINDOW=9`). Native 120, 120 Hz, before the late wait:
+
+| Level | fps | p99 ms | 1% low | longest frame | repeated pictures/s |
+| --- | --- | --- | --- | --- | --- |
+| 1-1 (Rooftops) | 119.8 | 9.39 to 9.46 | 105.7 to 106.5 | 74 to 78 ms | 0.75 |
+| 3-1 Jungle Joyride (`cave_canyons_half2`) | 120.0 | 9.29 | 107.6 | 14.4 ms | 0.68 |
+| 3-2 Under Tale (`world3_1_Indy_cave_split1`) | 119.5 | 9.32 | 107.3 | 129.7 ms | 1.12 |
+| 3-3 (`sea_whale_split2`) | 119.5 | 9.60 | 104.2 | 176.3 ms | 1.28 |
+| 3-4 (`forest_castle`) | 120.0 | 9.50 | 105.3 | 12.3 ms | 0.74 |
+
+The long frames in 3-2 and 3-3 were pipeline compiles the first time an effect appeared
+(3 pipelines in 168 ms, 8 in 247 ms), which the pipeline cache removes from the second session
+on.
+
+### The pipeline cache crashed the second start: fixed
+
+The emulator stores each pipeline's shader information (`Shader::Info`) by copying its bytes.
+The image and sampler lists in it were `boost::container::small_vector`s, whose bytes include a
+pointer to their elements: read back in the next session, that pointer pointed into the process
+that wrote the cache, and building the cached pipelines at start crashed (first in
+`ComputePipeline`'s descriptor layout, then anywhere the lists were read). They are now
+`static_vector`s with the same capacities (64 images, 32 samplers), like the buffer and fmask
+lists already were. Also:
+
+- `ImageResource::NumBindings` reads the image's sharp only for images whose mips the shader
+  indexes, the only case that needs it;
+- a cached pipeline with such an image is not built at start (there is no game memory to read
+  then) but when the game first uses it.
+
+With the cache warm, level 1 compiled no shader or pipeline in a whole run (it compiled about 170
+pipelines in the first), and its longest frame went from 66 to 83 ms down to 33 ms. Cached and
+freshly compiled pipelines give the same pictures (screenshots compared in levels 3-1 and 3-3).
+The cache is thrown away whenever `shadps4.exe` changes (its size and time), so every new
+build starts empty. `tools/make-release.sh` now turns it on in the release's `config.json`;
+`tools/pc-bench.sh` has `PIPELINE_CACHE=1|0` (and copies the exe with its time kept, so the
+cache survives between runs).
+
+### The window gets at most 60 frames a second (SHADPS4_VR_WINDOW_FPS)
+
+In the in-process OpenXR mode every headset frame was also drawn a second time, side by side
+and small, for the game's window on the desktop, and presented there 120 times a second. With
+the desktop composing at a 60 Hz monitor's rate the window's images come back late, and the GPU
+command thread waited for a free one. The window now gets at most 60 frames a second
+(`SHADPS4_VR_WINDOW_FPS`, 0 for none). With the 4K monitor on, in level 1:
+
+| Window frames a second | p99 ms | 1% low |
+| --- | --- | --- |
+| 120 (as before) | 10.96 | 91.2 |
+| 60 (default) | 9.87 | 101.3 |
+| 0 | 9.33 | 107.2 |
+
+### Tried and left off: SUBMIT_OVERLAP
+
+After `sceGnmSubmitDone` the emulator holds the game's next submission until the GPU command
+thread has gone through everything before it. `SHADPS4_PERF_SUBMIT_OVERLAP=1` lets the next
+frame be submitted meanwhile (the command lists are read where the game wrote them, and the
+game waits for the GPU itself before reusing them; with `copyGPUBuffers` it stays off). In
+level 1 it did not reduce repeated pictures (1.00 a second against 0.75 to 0.87 without it, and
+worse in one paired run on a busier PC), so it is off by default.
+
+### Measuring on a PC that is in use
+
+The same build and settings gave 28% GPU load and 0.30 repeated pictures a second in level 1 at
+night (monitor asleep), and 45 to 50% GPU load with 0.5 to 14 a second in the morning, with the
+4K monitor on and other programs open. Compare settings in runs made back to back.
+
 ## Reference: environment variables
 
 In the PC play folder, add them as `env=NAME=value` lines in `pc-vr\settings.txt`.
 
 ### Optimization switches (`SHADPS4_PERF_*`)
 
-All are on by default. `SHADPS4_PERF_<NAME>=0` turns one off. `SHADPS4_PERF_ALL=0` turns all of
+All but `SUBMIT_OVERLAP` are on by default. `SHADPS4_PERF_<NAME>=0` turns one off (`=1` on). `SHADPS4_PERF_ALL=0` turns all of
 them off, and a switch named on its own wins over `ALL`.
 
 | Switch | Default | Since | What it does |
@@ -606,6 +715,7 @@ them off, and a switch named on its own wins over `ALL`.
 | `PRECISE_TIMERS` | on | this work | HR timers of 1.2 ms or more on a precise timer thread |
 | `PRECISE_SLEEP` | on | this work | one high-resolution waitable timer per thread for sleeps |
 | `STREAM_MEMO` | on | this work | reuse of stream-buffer copies of the same data |
+| `SUBMIT_OVERLAP` | **off** | this work | the next frame may be submitted before the GPU thread is idle (`=1` to try) |
 
 ### Settings added in this work
 
@@ -621,6 +731,8 @@ them off, and a switch named on its own wins over `ALL`.
 | `SHADPS4_PROFILE_THREADS` | GPU command thread | threads to profile by name, comma-separated (with `SHADPS4_PROFILE`) |
 | `SHADPS4_PROFILE_RAW` | off | `1`: every profile sample in `profile_<thread>.csv` |
 | `SHADPS4_BENCH_STREAM` | off | `1`: the `Bench:` line's stream-repeat analysis (costs GPU thread time) |
+| `SHADPS4_XR_LATE_WAIT_MS` | 3 | how long the headset thread waits for a frame that is about to arrive, 0 to 6 |
+| `SHADPS4_VR_WINDOW_FPS` | 60 | most frames a second for the desktop window while a headset of this PC shows every frame; 0: none |
 | `OPENXR_SIM_REFRESH_HZ` | 90 | OpenXR Simulator only: its refresh rate, 30 to 500 |
 
 ### Settings used above that existed before

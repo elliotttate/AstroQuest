@@ -1,0 +1,44 @@
+# World 3, level 3-2 UNDER TALE (world3_1_Indy_cave_split1), for tools/pc-bench.sh with SAVE=build/pc-bench/save-all
+# (a save with all five worlds cleared: tools/re/astro-bot/make_save.py). CONTINUE, the
+# outline screen, World 3 in the world select, 1 step(s) of the left stick to level 3-2,
+# chosen at 56 s (it loads by about 75 s); then Astro walks forward, jumping every 3 s, and
+# turns around now and then. Use FROM_WINDOW=9. Times count from the start of the emulator.
+0 1000 pad=0,-0.17,-0.5
+20 0.3 cross
+24 0.3 cross
+28 0.3 cross
+32 0.3 cross
+36 0.3 cross
+40 0.3 cross
+44 0.3 lx=0
+56 0.3 cross
+85 85 ly=0
+88 0.3 cross
+91 0.3 cross
+94 0.3 cross
+97 0.3 cross
+100 0.3 cross
+103 0.3 cross
+106 0.3 cross
+109 0.3 cross
+112 0.3 cross
+115 0.3 cross
+118 0.3 cross
+121 0.3 cross
+124 0.3 cross
+127 0.3 cross
+130 0.3 cross
+133 0.3 cross
+136 0.3 cross
+139 0.3 cross
+142 0.3 cross
+145 0.3 cross
+148 0.3 cross
+151 0.3 cross
+154 0.3 cross
+157 0.3 cross
+160 0.3 cross
+163 0.3 cross
+166 0.3 cross
+110 4 rx=255
+135 4 rx=0

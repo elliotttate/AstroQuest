@@ -16,7 +16,8 @@
 # decides what is possible: at 120 Hz 120, 60, 40 or 30; at 90 Hz 90, 45 or 30; at 72 Hz 72 or
 # 36. 60 is the console's own. At 120 the game runs in its own 120 frames a second mode: a new
 # frame, drawn and stepped, at every refresh (a PC with an i9-13900KF and an RTX 5090 keeps it
-# at 119.8 in the first level, with about one refresh in a hundred showing a frame again).
+# at 119.5 to 120 in the levels measured; fewer than one picture in a hundred shows a frame
+# again, and at the best of times one in four hundred).
 # native_rate=0 keeps the game at its 60 and drives it twice as fast instead (about 112). Above
 # 60 the few things the game counts in frames (some animated signs) run faster.
 #fps=60

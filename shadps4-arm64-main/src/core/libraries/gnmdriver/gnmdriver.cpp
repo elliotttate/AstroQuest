@@ -13,6 +13,7 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/perf_toggles.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
 #include "core/bench_stats.h"
@@ -2336,9 +2337,22 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     }
     Core::KnownTitle::OnFrameSubmitted();
     Core::Bench::OnFrame();
-    WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+    // SUBMIT_OVERLAP: the title's next frame may be submitted while the GPU thread is still
+    // turning this one into host commands. Without it every frame's first submission waited
+    // until the GPU thread had gone through all of the frame before (and its end-of-frame
+    // work), so a frame that took the GPU thread longer held up the next one's start as well.
+    // The command lists are read where the title wrote them, and the title itself waits for
+    // the GPU (its labels and end-of-pipe events) before it writes into lists still in use:
+    // only copied command lists (copyGPUBuffers), whose space is reused from the start at
+    // every frame, need the wait. Off unless asked for (SHADPS4_PERF_SUBMIT_OVERLAP=1): in
+    // Astro Bot at 120 frames a second the headset showed a frame again no less often with it.
+    static const bool overlap =
+        Common::PerfToggle("SUBMIT_OVERLAP", false) && !EmulatorSettings.IsCopyGpuBuffers();
+    if (!overlap) {
+        WaitGpuIdle();
+        if (!liverpool->IsGpuIdle()) {
+            submission_lock = true;
+        }
     }
     liverpool->SubmitDone();
     send_init_packet = true;

@@ -427,7 +427,7 @@ void Report(const std::vector<Sample>& samples, const std::string& thread_name, 
     // emulator it was in, for picking out the samples of chosen moments.
     static const bool raw = std::getenv("SHADPS4_PROFILE_RAW") != nullptr;
     if (raw) {
-        std::string csv = "ms,leaf,guest,callee\n";
+        std::string csv = "ms,leaf,guest,callee,emulator\n";
         for (const auto& sample : samples) {
             if (sample.depth == 0) {
                 continue;
@@ -443,14 +443,23 @@ void Report(const std::vector<Sample>& samples, const std::string& thread_name, 
                 break;
             }
             std::string leaf = symbols.Inner(sample.pcs[0]);
-            for (std::string* text : {&leaf, &callee}) {
-                std::ranges::replace(*text, ',', ';');
-                if (text->size() > 120) {
-                    text->resize(120);
+            // The innermost three of the emulator's own functions on the stack.
+            std::string emulator;
+            for (u32 i = 0, found = 0; i < sample.depth && found < 3; ++i) {
+                const std::string& name = symbols.Outer(i == 0 ? sample.pcs[0] : sample.pcs[i] - 1);
+                if (IsEmulatorFunction(name)) {
+                    emulator += (found++ != 0 ? " < " : "") + name.substr(0, 70);
                 }
             }
-            std::snprintf(line, sizeof(line), "%.3f,%s,%s,%s\n", sample.ms, leaf.c_str(),
-                          site.c_str(), callee.c_str());
+            for (std::string* text : {&leaf, &callee, &emulator}) {
+                std::ranges::replace(*text, ',', ';');
+                const size_t most = text == &emulator ? 230 : 120;
+                if (text->size() > most) {
+                    text->resize(most);
+                }
+            }
+            std::snprintf(line, sizeof(line), "%.3f,%s,%s,%s,%s\n", sample.ms, leaf.c_str(),
+                          site.c_str(), callee.c_str(), emulator.c_str());
             csv += line;
         }
         const auto csv_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /

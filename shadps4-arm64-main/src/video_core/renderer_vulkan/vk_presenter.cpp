@@ -901,7 +901,27 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
     Frame* const local = exported ? nullptr : vr_exporter->AcquireLocal(eye_width * 2, eye_height);
     if (!exported) {
         expected_ratio = static_cast<float>(eye_width * 2) / static_cast<float>(eye_height);
-        frame = GetRenderFrame();
+        // SHADPS4_VR_WINDOW_FPS=<n> (60; 0: none): while a headset of this machine is shown
+        // every frame, the window gets at most so many a second. Its picture is drawn and
+        // presented besides the headset's, and a desktop that composes at its monitor's rate
+        // (60 Hz) has the window's images back late: the GPU thread then waited for one, and
+        // the headset's frames came late with it.
+        static const double window_fps = [] {
+            const char* value = std::getenv("SHADPS4_VR_WINDOW_FPS");
+            return value != nullptr ? std::clamp(std::atof(value), 0.0, 1000.0) : 60.0;
+        }();
+        static auto last_window = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        const bool window_due =
+            local == nullptr ||
+            (window_fps > 0.0 &&
+             now - last_window >= std::chrono::duration<double>(0.9 / window_fps));
+        if (window_due) {
+            frame = GetRenderFrame();
+            if (frame != nullptr) {
+                last_window = now;
+            }
+        }
         if (!frame && !local) {
             return {};
         }

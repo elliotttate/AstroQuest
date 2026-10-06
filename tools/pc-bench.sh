@@ -24,6 +24,8 @@
 #   SCRIPT=<file>          the input script of the runs (tools/bench/level1-walk.txt)
 #   GAME_ARGS="<args>"     arguments for the game itself (after --)
 #   SAVE=<dir>             the save the runs start from (build/pc-bench/save: World 1 reached)
+#   PIPELINE_CACHE=1       with the emulator's pipeline cache (kept in build/pc-bench/bin/user
+#                          between runs); 0: without (the play folder's own setting otherwise)
 # Results in build/pc-bench/<name>/: run-<n>/ (log, Bench lines, pictures) and summary.txt.
 # Nothing else may be running the emulator meanwhile: each one asks Windows for about 14 GB.
 set -u
@@ -39,6 +41,9 @@ base=$root/build/pc-bench
 bin=$base/bin
 out=$base/$name
 eboot=$(cygpath -w "$root/games/CUSA12392/eboot.bin")
+# (The runs start in the build's folder: paths given relative to here are made absolute.)
+[ -n "${SCRIPT:-}" ] && SCRIPT=$(cd "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")
+[ -n "${SAVE:-}" ] && SAVE=$(cd "$SAVE" && pwd)
 
 running() { tasklist //FI "IMAGENAME eq shadps4.exe" //FO CSV //NH | grep -qi shadps4; }
 
@@ -73,13 +78,18 @@ fi
 
 # The build, with a user folder of its own (the play folder's settings, the frame rate shown).
 mkdir -p "$bin/user" "$out"
-cp "$exe" "$bin/shadps4.exe"
-[ -f "${exe%.exe}.pdb" ] && cp "${exe%.exe}.pdb" "$bin/shadps4.pdb"
+cp -p "$exe" "$bin/shadps4.exe"
+[ -f "${exe%.exe}.pdb" ] && cp -p "${exe%.exe}.pdb" "$bin/shadps4.pdb"
 cp -r "$root/pc-vr/user/input_config" "$bin/user/" 2>/dev/null
-python - "$(cygpath -w "$root/pc-vr/user/config.json")" "$(cygpath -w "$bin/user/config.json")" <<'EOF'
+python - "$(cygpath -w "$root/pc-vr/user/config.json")" "$(cygpath -w "$bin/user/config.json")" "${PIPELINE_CACHE:-}" <<'EOF'
 import json, sys
 c = json.load(open(sys.argv[1]))
 c.setdefault('General', {})['show_fps_counter'] = True
+cache = sys.argv[3]
+if cache in ('0', '1'):
+    for section in c.values():
+        if isinstance(section, dict) and 'pipeline_cache_enabled' in section:
+            section['pipeline_cache_enabled'] = cache == '1'
 json.dump(c, open(sys.argv[2], 'w'), indent=2)
 EOF
 
