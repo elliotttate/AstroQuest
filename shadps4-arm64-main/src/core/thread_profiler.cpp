@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,7 +25,9 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/singleton.h"
 #include "common/types.h"
+#include "core/linker.h"
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -36,12 +40,10 @@ constexpr size_t MaxDepth = 48;
 struct Sample {
     u32 depth{};
     std::array<u64, MaxDepth> pcs{};
+    /// When it was taken: steady clock, milliseconds since its epoch.
+    double ms{};
 };
 
-// Where the profiled thread's stack is: the fields of its thread information block, read at
-// every sample (the committed part grows).
-const volatile u64* stack_base_field = nullptr;
-const volatile u64* stack_limit_field = nullptr;
 
 // Walks the stack of a stopped thread with the unwind data of the modules its frames are in.
 // Nothing here may allocate: the stopped thread may hold the heap's lock. Nothing may fault
@@ -136,6 +138,17 @@ bool UnwindStaysOnStack(const CONTEXT& context, u64 image_base, const RUNTIME_FU
 }
 
 u32 WalkBounded(CONTEXT context, std::array<u64, MaxDepth>& pcs, u64 stack_base, u64 stack_limit) {
+    // A title's thread runs on a stack the emulator made for it, not where its thread
+    // information block says: the committed memory around its stack pointer is taken instead.
+    if (context.Rsp < stack_limit || context.Rsp >= stack_base) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &info, sizeof(info)) ==
+                sizeof(info) &&
+            info.State == MEM_COMMIT) {
+            stack_limit = reinterpret_cast<u64>(info.BaseAddress);
+            stack_base = stack_limit + info.RegionSize;
+        }
+    }
     const auto on_stack = [&](u64 sp) {
         return (sp & 7) == 0 && sp >= stack_limit && sp + 256 <= stack_base;
     };
@@ -167,8 +180,9 @@ u32 WalkBounded(CONTEXT context, std::array<u64, MaxDepth>& pcs, u64 stack_base,
     return depth;
 }
 
-u32 Walk(CONTEXT context, std::array<u64, MaxDepth>& pcs) {
-    return WalkBounded(context, pcs, *stack_base_field, *stack_limit_field);
+u32 Walk(CONTEXT context, std::array<u64, MaxDepth>& pcs, const volatile u64* base_field,
+         const volatile u64* limit_field) {
+    return WalkBounded(context, pcs, *base_field, *limit_field);
 }
 
 struct Symbols {
@@ -194,9 +208,8 @@ struct Symbols {
                           static_cast<unsigned long long>(address - module.BaseOfImage));
             return text;
         }
-        char text[32];
-        std::snprintf(text, sizeof(text), "%#llx", static_cast<unsigned long long>(address));
-        return text;
+        // Outside every module: the title's own code (or code made at run time).
+        return "[guest code]";
     }
 
     // The function the address is in, as the compiler laid it out.
@@ -294,8 +307,29 @@ bool IsEmulatorFunction(const std::string& name) {
 }
 
 void Report(const std::vector<Sample>& samples, const std::string& thread_name, double seconds) {
+    // (The symbol library is not to be used by two threads at once.)
+    static std::mutex report_mutex;
+    std::scoped_lock report_lock{report_mutex};
     Symbols symbols;
-    std::unordered_map<std::string, u32> self, inclusive, by_line, sink_callers;
+    std::unordered_map<std::string, u32> self, inclusive, by_line, sink_callers, guest_sites;
+    std::unordered_map<u64, std::string> guest_names;
+    auto* linker = Common::Singleton<Core::Linker>::Instance();
+    // A place in the title's code (or one of its modules): module+offset, as in a disassembly of
+    // the module loaded at 0.
+    const auto guest_name = [&](u64 address) -> const std::string& {
+        auto [it, is_new] = guest_names.try_emplace(address);
+        if (is_new) {
+            char text[160];
+            if (auto* module = linker->FindByAddress(address); module != nullptr) {
+                std::snprintf(text, sizeof(text), "%s+%#llx", module->name.c_str(),
+                              static_cast<unsigned long long>(address - module->GetBaseAddress()));
+            } else {
+                std::snprintf(text, sizeof(text), "%#llx", static_cast<unsigned long long>(address));
+            }
+            it->second = text;
+        }
+        return it->second;
+    };
     u32 waiting = 0;
     for (const auto& sample : samples) {
         if (sample.depth == 0) {
@@ -331,6 +365,16 @@ void Report(const std::vector<Sample>& samples, const std::string& thread_name, 
                     }
                 }
             }
+        }
+        // The innermost frame in the title's code, and what of the emulator it was in.
+        for (u32 i = 0; i < sample.depth; ++i) {
+            if (symbols.Module(sample.pcs[i]) != "[guest code]") {
+                continue;
+            }
+            const std::string callee =
+                i == 0 ? std::string{"(running)"} : symbols.Outer(sample.pcs[i - 1] - (i > 1));
+            ++guest_sites[guest_name(sample.pcs[i]) + "  " + callee];
+            break;
         }
         std::unordered_set<std::string> seen;
         seen.insert(leaf_name);
@@ -374,6 +418,48 @@ void Report(const std::vector<Sample>& samples, const std::string& thread_name, 
     section("Self by source line:", by_line, 60);
     section("Allocations, locks, copies and driver calls, by the emulator function that made them:",
             sink_callers, 80);
+    section("The innermost place in the title's code (a return address, module+offset) and the "
+            "emulator function it was in:",
+            guest_sites, 60);
+
+    // SHADPS4_PROFILE_RAW=1: every sample as well, in profile_<thread>.csv: when (steady clock,
+    // ms), the innermost function, the innermost place in the title's code and what of the
+    // emulator it was in, for picking out the samples of chosen moments.
+    static const bool raw = std::getenv("SHADPS4_PROFILE_RAW") != nullptr;
+    if (raw) {
+        std::string csv = "ms,leaf,guest,callee\n";
+        for (const auto& sample : samples) {
+            if (sample.depth == 0) {
+                continue;
+            }
+            std::string site = "-", callee = "-";
+            for (u32 i = 0; i < sample.depth; ++i) {
+                if (symbols.Module(sample.pcs[i]) != "[guest code]") {
+                    continue;
+                }
+                site = guest_name(sample.pcs[i]);
+                callee = i == 0 ? std::string{"(running)"}
+                                : symbols.Outer(sample.pcs[i - 1] - (i > 1));
+                break;
+            }
+            std::string leaf = symbols.Inner(sample.pcs[0]);
+            for (std::string* text : {&leaf, &callee}) {
+                std::ranges::replace(*text, ',', ';');
+                if (text->size() > 120) {
+                    text->resize(120);
+                }
+            }
+            std::snprintf(line, sizeof(line), "%.3f,%s,%s,%s\n", sample.ms, leaf.c_str(),
+                          site.c_str(), callee.c_str());
+            csv += line;
+        }
+        const auto csv_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                              ("profile_" + thread_name + ".csv");
+        if (FILE* file = _wfopen(csv_path.c_str(), L"wb"); file != nullptr) {
+            std::fwrite(csv.data(), 1, csv.size(), file);
+            std::fclose(file);
+        }
+    }
 
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
                       ("profile_" + thread_name + ".txt");
@@ -385,7 +471,16 @@ void Report(const std::vector<Sample>& samples, const std::string& thread_name, 
              samples.size());
 }
 
-void Run(HANDLE thread, std::string thread_name, double start, double seconds, double rate) {
+void Run(HANDLE thread, std::string thread_name, double start, double seconds, double rate,
+         const volatile u64* base_field, const volatile u64* limit_field) {
+    {
+        static std::mutex names_mutex;
+        static std::unordered_map<std::string, u32> names;
+        std::scoped_lock lock{names_mutex};
+        if (const u32 seen = names[thread_name]++; seen != 0) {
+            thread_name += "_" + std::to_string(seen + 1);
+        }
+    }
     std::this_thread::sleep_for(std::chrono::duration<double>(start));
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * rate * 1.2) + 64);
@@ -419,8 +514,11 @@ void Run(HANDLE thread, std::string thread_name, double start, double seconds, d
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
         Sample& sample = samples.emplace_back();
+        sample.ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
         if (GetThreadContext(thread, &context)) {
-            sample.depth = Walk(context, sample.pcs);
+            sample.depth = Walk(context, sample.pcs, base_field, limit_field);
         }
         ResumeThread(thread);
     }
@@ -578,13 +676,31 @@ void ProfileCurrentThread(const char* thread_name) {
     if (value == nullptr) {
         return;
     }
+    // SHADPS4_PROFILE_THREADS=<name>[,<name>...]: the threads to profile, by the names they give
+    // themselves (each one starts its profile as it is named). Without it, the GPU command
+    // thread only.
+    if (const char* threads = std::getenv("SHADPS4_PROFILE_THREADS"); threads != nullptr) {
+        const std::string_view list{threads};
+        const std::string_view name{thread_name};
+        bool listed = false;
+        for (size_t at = 0; at <= list.size();) {
+            const size_t comma = std::min(list.find(',', at), list.size());
+            listed |= list.substr(at, comma - at) == name;
+            at = comma + 1;
+        }
+        if (!listed) {
+            return;
+        }
+    } else if (std::string_view{thread_name} != "GpuCommandProcessor") {
+        return;
+    }
     double start = 30.0, seconds = 30.0, rate = 1000.0;
     std::sscanf(value, "%lf,%lf,%lf", &start, &seconds, &rate);
     rate = std::clamp(rate, 10.0, 10000.0);
     // (Called on the thread to profile: its own thread information block.)
     const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
-    stack_base_field = reinterpret_cast<const volatile u64*>(&tib->StackBase);
-    stack_limit_field = reinterpret_cast<const volatile u64*>(&tib->StackLimit);
+    const auto* base_field = reinterpret_cast<const volatile u64*>(&tib->StackBase);
+    const auto* limit_field = reinterpret_cast<const volatile u64*>(&tib->StackLimit);
     HANDLE thread = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread,
                          THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
@@ -595,7 +711,7 @@ void ProfileCurrentThread(const char* thread_name) {
     std::ranges::replace_if(name, [](char c) { return c == ':' || c == ' '; }, '_');
     LOG_INFO(Core, "Profiling {} from {} s on for {} s, {} samples a second", thread_name, start,
              seconds, rate);
-    std::thread{Run, thread, std::move(name), start, seconds, rate}.detach();
+    std::thread{Run, thread, std::move(name), start, seconds, rate, base_field, limit_field}.detach();
 }
 
 } // namespace Core::Profiler

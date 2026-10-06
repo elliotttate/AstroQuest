@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -230,6 +231,35 @@ void FrameStats::Time(Stage stage, std::chrono::nanoseconds time) {
     if (Enabled() && time.count() >= 0) {
         g_stage_times.total[static_cast<size_t>(stage)] += static_cast<u64>(time.count());
         ++g_stage_times.count[static_cast<size_t>(stage)];
+        // SHADPS4_FRAME_STATS_CSV=1: every frame's times as well, in frame_stats.csv in the
+        // log folder (when, which stage, how long), for finding the frames that took longer.
+        static const bool csv = std::getenv("SHADPS4_FRAME_STATS_CSV") != nullptr;
+        if (csv) {
+            static std::mutex csv_mutex;
+            static std::FILE* file = [] {
+                const auto path =
+                    Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "frame_stats.csv";
+                std::FILE* made = std::fopen(path.string().c_str(), "w");
+                if (made != nullptr) {
+                    std::fputs("ms,stage,took_ms\n", made);
+                }
+                return made;
+            }();
+            static constexpr std::array<const char*, 6> Names{"submitting", "catchup", "translate",
+                                                               "queued", "gpuwait", "latency"};
+            if (file != nullptr) {
+                std::scoped_lock lock{csv_mutex};
+                std::fprintf(file, "%.3f,%s,%.3f\n",
+                             std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count(),
+                             Names[static_cast<size_t>(stage)], time.count() / 1e6);
+                static u32 lines = 0;
+                if (++lines % 1024 == 0) {
+                    std::fflush(file);
+                }
+            }
+        }
     }
 }
 

@@ -13,6 +13,8 @@ namespace Core::Profiler {
 /// <log folder>/profile_<thread>.txt; it needs the program's .pdb next to it to name functions.
 /// Windows only; elsewhere this does nothing.
 void ProfileCurrentThread(const char* thread_name);
+/// (With SHADPS4_PROFILE_THREADS=<name>[,<name>...] the threads listed are profiled instead, by
+/// the names they give themselves: Common::SetCurrentThreadName calls this.)
 
 /// SHADPS4_STACKS=<seconds>[,<seconds>...]: at those times after this call, the call stack of
 /// every thread of the emulator goes to <log folder>/stacks_<seconds>s.txt (each thread stopped

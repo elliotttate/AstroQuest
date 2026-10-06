@@ -22,6 +22,7 @@
 #include <SDL3/SDL_events.h>
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/polyfill_thread.h"
 #include "common/singleton.h"
 #include "common/thread.h"
@@ -237,6 +238,7 @@ struct OpenXrHost::Impl {
         PresentedFrame info;
         vk::Semaphore ready_semaphore;
         u64 ready_tick{};
+        Clock::time_point delivered;
     };
 
     struct Retired {
@@ -340,6 +342,9 @@ struct OpenXrHost::Impl {
     Clock::time_point last_delivery;
     double longest_gap{};
     u32 long_gaps{};
+    // (Under slot_mutex.) Frames replaced by a newer one before the headset took them: never
+    // shown.
+    u32 skipped_frames{};
 
     // What is being shown.
     bool have_frame{};
@@ -409,6 +414,19 @@ struct OpenXrHost::Impl {
     u32 display_frames{};
     u32 reported_delivered{};
     u32 copied_frames{};
+    // Pictures that showed the same frame as the one before (the title's frame was not there
+    // in time), and the most of them in a row.
+    u32 repeated_pictures{};
+    u32 repeat_run{};
+    u32 longest_repeat_run{};
+    // How long frames waited between being handed over and being taken, for the log.
+    double wait_sum{};
+    double wait_worst{};
+    // SHADPS4_XR_FRAME_LOG=1: every picture the headset took, in xr_frames.csv in the log
+    // folder: when, which of the title's frames it showed, whether that was a new one, how long
+    // it had waited.
+    std::FILE* frame_log{};
+    u64 picture_number{};
     u32 head_tracked_frames{};
     u32 palm_samples{};
     float palm_distance{};
@@ -1513,6 +1531,8 @@ struct OpenXrHost::Impl {
             UpdateControllers(pose_time);
             UpdatePad(pose_time);
 
+            bool new_picture = false;
+            double picture_wait = 0.0;
             if (const s32 index = TakeFrame(); index >= 0) {
                 const auto started = Clock::now();
                 bool blank = false;
@@ -1521,6 +1541,10 @@ struct OpenXrHost::Impl {
                 std::scoped_lock lock{slot_mutex};
                 Slot& slot = slots[index];
                 if (copied) {
+                    new_picture = true;
+                    picture_wait = std::chrono::duration<double>(woke - slot.delivered).count();
+                    wait_sum += picture_wait;
+                    wait_worst = std::max(wait_worst, picture_wait);
                     shown = slot.info;
                     shown_width = slot.width;
                     shown_height = slot.height;
@@ -1536,6 +1560,32 @@ struct OpenXrHost::Impl {
                 if (slot.state == Slot::State::Reading) {
                     slot.state = Slot::State::Free;
                 }
+            }
+
+            if (frame_state.shouldRender == XR_TRUE && have_frame) {
+                if (new_picture) {
+                    repeat_run = 0;
+                } else {
+                    ++repeated_pictures;
+                    longest_repeat_run = std::max(longest_repeat_run, ++repeat_run);
+                }
+                static const bool log_frames = EnvFloat("SHADPS4_XR_FRAME_LOG", 0.0f) > 0.0f;
+                if (log_frames && frame_log == nullptr) {
+                    const auto path =
+                        Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "xr_frames.csv";
+                    frame_log = std::fopen(path.string().c_str(), "w");
+                    if (frame_log != nullptr) {
+                        std::fputs("picture,ms,frame,new,waited_ms\n", frame_log);
+                    }
+                }
+                if (frame_log != nullptr) {
+                    std::fprintf(frame_log, "%llu,%.3f,%u,%d,%.3f\n",
+                                 static_cast<unsigned long long>(picture_number),
+                                 std::chrono::duration<double, std::milli>(woke - session_started)
+                                     .count(),
+                                 shown.id, new_picture ? 1 : 0, picture_wait * 1e3);
+                }
+                ++picture_number;
             }
 
             XrCompositionLayerProjectionView views[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
@@ -2203,12 +2253,25 @@ struct OpenXrHost::Impl {
         const XrVector3f forward = Rotate(head_pose.orientation, {0.0f, 0.0f, -1.0f});
         double gap;
         u32 gaps;
+        u32 skipped;
         {
             std::scoped_lock lock{slot_mutex};
             gap = longest_gap;
             gaps = long_gaps;
+            skipped = skipped_frames;
             longest_gap = 0.0;
             long_gaps = 0;
+            skipped_frames = 0;
+        }
+        LOG_INFO(Core_Vr,
+                 "Headset pictures: {} of {} repeated the frame before ({:.1f} a second, at most "
+                 "{} in a row), {} frames were never shown (a newer one came first); frames "
+                 "waited {:.2f} ms on average to be taken ({:.2f} at worst)",
+                 repeated_pictures, display_frames, static_cast<float>(repeated_pictures) / seconds,
+                 longest_repeat_run, skipped, copied_frames != 0 ? wait_sum / copied_frames * 1e3 : 0.0,
+                 wait_worst * 1e3);
+        if (frame_log != nullptr) {
+            std::fflush(frame_log);
         }
         LOG_INFO(Core_Vr,
                  "Headset: the title delivered {:.1f} frames a second ({:.0f} ms the longest "
@@ -2292,6 +2355,10 @@ struct OpenXrHost::Impl {
         reported_delivered = delivered_frames.load(std::memory_order_relaxed);
         display_frames = 0;
         copied_frames = 0;
+        repeated_pictures = 0;
+        longest_repeat_run = 0;
+        wait_sum = 0.0;
+        wait_worst = 0.0;
         head_tracked_frames = 0;
         palm_samples = 0;
         palm_distance = 0.0f;
@@ -2591,10 +2658,16 @@ void OpenXrHost::EndFrame(u32 index, const PresentedFrame& info, vk::Semaphore r
     if (slot.state != Impl::Slot::State::Drawing) {
         return;
     }
+    // The frame handed over before, if the headset has not taken it, is never shown now.
+    if (impl->latest >= 0 && impl->latest != static_cast<s32>(index % NumSlots) &&
+        impl->slots[impl->latest].state == Impl::Slot::State::Ready) {
+        ++impl->skipped_frames;
+    }
     slot.state = Impl::Slot::State::Ready;
     slot.info = info;
     slot.ready_semaphore = ready_semaphore;
     slot.ready_tick = ready_tick;
+    slot.delivered = Clock::now();
     impl->latest = static_cast<s32>(index % NumSlots);
     impl->delivered_frames.fetch_add(1, std::memory_order_relaxed);
     const auto now = Clock::now();

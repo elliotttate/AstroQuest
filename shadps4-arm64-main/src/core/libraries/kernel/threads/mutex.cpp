@@ -1,9 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -14,6 +20,77 @@ namespace Libraries::Kernel {
 
 static constexpr u32 MUTEX_ADAPTIVE_SPINS = 2000;
 static std::mutex MutxStaticLock;
+
+// SHADPS4_MUTEX_STATS=<seconds>: for finding what the title's threads wait for. That often, the
+// log gets the guest mutexes waited on longest (where a lock had to sleep): how long, by which
+// threads, and which threads held them when the waits began.
+namespace {
+struct MutexWaits {
+    std::string name;
+    u64 waits{};
+    u64 ns{};
+    std::unordered_map<std::string, u64> waiters;
+    std::unordered_map<std::string, u64> owners;
+};
+
+double MutexStatsPeriod() {
+    static const double period = [] {
+        const char* value = std::getenv("SHADPS4_MUTEX_STATS");
+        return value != nullptr ? std::max(1.0, std::atof(value)) : 0.0;
+    }();
+    return period;
+}
+
+std::string ThreadName(const Pthread* thread) {
+    return thread != nullptr ? thread->name : std::string{"(none)"};
+}
+
+void NoteMutexWait(const PthreadMutex* mutex, const std::string& owner, const std::string& waiter,
+                   u64 ns) {
+    using Clock = std::chrono::steady_clock;
+    static std::mutex stats_lock;
+    static std::unordered_map<const PthreadMutex*, MutexWaits> stats;
+    static Clock::time_point window = Clock::now();
+    std::scoped_lock lock{stats_lock};
+    auto& entry = stats[mutex];
+    if (entry.waits == 0) {
+        entry.name = mutex->name;
+    }
+    ++entry.waits;
+    entry.ns += ns;
+    entry.waiters[waiter] += ns;
+    entry.owners[owner] += ns;
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - window).count();
+    if (seconds < MutexStatsPeriod()) {
+        return;
+    }
+    std::vector<std::pair<const PthreadMutex*, MutexWaits*>> sorted;
+    for (auto& [address, waits] : stats) {
+        sorted.emplace_back(address, &waits);
+    }
+    std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second->ns > b.second->ns; });
+    const auto top = [](const std::unordered_map<std::string, u64>& by) {
+        std::vector<std::pair<std::string, u64>> list{by.begin(), by.end()};
+        std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string text;
+        for (size_t i = 0; i < std::min<size_t>(list.size(), 4); ++i) {
+            text += fmt::format("{}{} {:.0f} ms", i ? ", " : "", list[i].first, list[i].second / 1e6);
+        }
+        return text;
+    };
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); ++i) {
+        const auto& [address, waits] = sorted[i];
+        LOG_INFO(Kernel_Pthread,
+                 "Mutex waits in {:.0f} s: {} '{}' waited on {} times, {:.1f} ms in all; by {}; "
+                 "held by {}",
+                 seconds, fmt::ptr(address), waits->name, waits->waits, waits->ns / 1e6,
+                 top(waits->waiters), top(waits->owners));
+    }
+    stats.clear();
+    window = now;
+}
+} // Anonymous namespace
 
 #define THR_MUTEX_INITIALIZER ((PthreadMutex*)NULL)
 #define THR_ADAPTIVE_MUTEX_INITIALIZER ((PthreadMutex*)1)
@@ -220,6 +297,13 @@ s32 PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec) {
     }
 
     s32 ret = 0;
+    const bool stats = MutexStatsPeriod() > 0.0;
+    std::string owner_name;
+    std::chrono::steady_clock::time_point wait_start;
+    if (stats) {
+        owner_name = ThreadName(m_owner);
+        wait_start = std::chrono::steady_clock::now();
+    }
     if (abstime == nullptr) {
         m_lock.lock();
     } else if (abstime != THR_RELTIME && (abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000))
@@ -234,6 +318,12 @@ s32 PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec) {
     }
     if (ret == 0) {
         m_owner = curthread;
+    }
+    if (stats) {
+        NoteMutexWait(this, owner_name, ThreadName(curthread),
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - wait_start)
+                          .count());
     }
     return ret;
 }

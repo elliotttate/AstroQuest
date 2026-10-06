@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "common/perf_toggles.h"
 #include "common/thread.h"
+#include "core/thread_profiler.h"
 #include "ntapi.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -211,6 +212,8 @@ void SetCurrentThreadName(const char* name) {
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
     t_thread_name = name;
     t_thread_name_known = true;
+    // (SHADPS4_PROFILE with SHADPS4_PROFILE_THREADS: profiled when it is one of those listed.)
+    Core::Profiler::ProfileCurrentThread(name);
 }
 
 void SetThreadName(void* thread, const char* name) {

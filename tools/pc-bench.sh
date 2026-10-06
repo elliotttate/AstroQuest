@@ -21,6 +21,9 @@
 #   FPS_CAP=<n>            with UNCAPPED=0, the most frames a second (90)
 #   RUN_SECONDS=<s>        length of a run (170: the level is reached at about 75 s)
 #   FROM_WINDOW=<n>        the first 10-second window counted (8: inside the level)
+#   SCRIPT=<file>          the input script of the runs (tools/bench/level1-walk.txt)
+#   GAME_ARGS="<args>"     arguments for the game itself (after --)
+#   SAVE=<dir>             the save the runs start from (build/pc-bench/save: World 1 reached)
 # Results in build/pc-bench/<name>/: run-<n>/ (log, Bench lines, pictures) and summary.txt.
 # Nothing else may be running the emulator meanwhile: each one asks Windows for about 14 GB.
 set -u
@@ -92,7 +95,7 @@ play() {
         SHADPS4_TITLE_RESOLUTION=6 SHADPS4_VR_SHARPEN=0.3 SHADPS4_VR_FOV_OF=headset \
         SHADPS4_XR_HEAD=0 SHADPS4_XR_PAUSE=0 SHADPS4_XR_WAIT=20 SHADPS4_SHOT_SECONDS=15 \
         SHADPS4_INPUT_SCRIPT="$(cygpath -w "$script")" "${xr_env[@]}" "${pace_env[@]}" "$@" \
-        ./shadps4.exe -g "$eboot" > "$dir/stdout.txt" 2>&1) &
+        ./shadps4.exe -g "$eboot" ${GAME_ARGS:+-- $GAME_ARGS} > "$dir/stdout.txt" 2>&1) &
     local pid=$!
     sleep "$seconds"
     local wpid
@@ -123,12 +126,13 @@ if [ ! -d "$base/save/CUSA12392" ]; then
     cp -r "$savedata/CUSA12392" "$base/save/"
 fi
 
+save=${SAVE:-$base/save}
 for r in $(seq 1 "$runs"); do
     rm -rf "$savedata/CUSA12392"
     mkdir -p "$savedata"
-    cp -r "$base/save/CUSA12392" "$savedata/"
+    cp -r "$save/CUSA12392" "$savedata/"
     echo "run $r of $runs..."
-    play "$out/run-$r" "$run_seconds" "$root/tools/bench/level1-walk.txt" "$@"
+    play "$out/run-$r" "$run_seconds" "${SCRIPT:-$root/tools/bench/level1-walk.txt}" "$@"
 done
 
 python - "$out" "$from_window" "$runs" "$name" "$uncapped" "$xr" "$*" <<'EOF' | tee "$out/summary.txt"
