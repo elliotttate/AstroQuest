@@ -204,6 +204,16 @@ scenes change (the title, the map, a level loading) single waits of 50 to 235 ms
 in the five and a half minutes from the start into the first level. The head's movement
 does not wait for them: the picture that is there keeps being turned by the compositor.
 
+## Performance work
+
+Since the text above was written, `fps=120` uses the game's own 120 frames a second mode (a new
+frame, simulated and rendered, at every refresh). On an i9-13900KF with an RTX 5090 the first
+level holds 119.8 frames a second, and about 99.4% of the headset's pictures are new frames.
+`native_rate=0` goes back to driving the game's 60 mode faster. What limited the PC, what was
+changed (precise timers, fewer buffer copies, present-thread pacing), the measurements, every
+switch, and how to reproduce the numbers are in
+[docs/pc-performance.md](docs/pc-performance.md).
+
 ## How it fits together
 
 ```
